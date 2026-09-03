@@ -13,8 +13,14 @@ use std::rc::Rc;
 use crate::geo::{wgs84g, LatLon, TILE_PX};
 use crate::tiles::{Dataset, TileCache, TileDesc, TileSource};
 
-/// Zoom MNT retenu : ~5 m/pixel sous nos latitudes, résolution validée sur Chamonix.
+/// Zoom MNT du profil altimétrique : ~5 m/pixel, résolution validée sur Chamonix.
 pub const DEM_ZOOM: u8 = 14;
+
+/// Zoom MNT de la pondération du graphe : ~38 m/pixel, mais une tuile couvre
+/// ~10 km au lieu de 1,2 km. Un rayon d'isochrone de 25 km demande ainsi une
+/// trentaine de tuiles au lieu de plus de mille — c'est ce qui rend l'isochrone
+/// jouable sans pipeline de pré-traitement.
+pub const GRAPH_DEM_ZOOM: u8 = 11;
 
 /// Les tuiles en bord de couverture portent une valeur sentinelle très négative.
 const NODATA_THRESHOLD: f32 = -1000.0;
@@ -88,15 +94,15 @@ impl DemStore {
         self.cache.stats()
     }
 
-    /// Altitude d'un pixel MNT global (indices sur toute la pyramide, zoom `DEM_ZOOM`).
+    /// Altitude d'un pixel MNT global (indices sur toute la pyramide, au zoom donné).
     /// Déclenche le chargement de la tuile manquante.
-    fn pixel(&mut self, gi: i64, gj: i64, ctx: &egui::Context) -> Option<f32> {
+    fn pixel(&mut self, gi: i64, gj: i64, zoom: u8, ctx: &egui::Context) -> Option<f32> {
         if gj < 0 {
             return None;
         }
         let side = TILE_PX as i64;
         let key = DemKey {
-            z: DEM_ZOOM,
+            z: zoom,
             col: gi.div_euclid(side) as u32,
             row: gj.div_euclid(side) as u32,
         };
@@ -114,11 +120,16 @@ impl DemStore {
         self.cache.peek(&key)?.sample(px, py)
     }
 
+    /// Altitude interpolée bilinéairement au zoom du profil.
+    pub fn elevation(&mut self, ll: LatLon, ctx: &egui::Context) -> Option<f32> {
+        self.elevation_at(ll, DEM_ZOOM, ctx)
+    }
+
     /// Altitude interpolée bilinéairement, y compris à cheval sur quatre tuiles.
     /// `None` = tuiles pas encore là (ou hors couverture) — l'appelant réessaiera
     /// à la frame suivante, le `request_repaint` du cache la provoquera.
-    pub fn elevation(&mut self, ll: LatLon, ctx: &egui::Context) -> Option<f32> {
-        let span = wgs84g::span_deg(DEM_ZOOM);
+    pub fn elevation_at(&mut self, ll: LatLon, zoom: u8, ctx: &egui::Context) -> Option<f32> {
+        let span = wgs84g::span_deg(zoom);
         let side = TILE_PX as f64;
         // Coordonnées en pixels sur toute la pyramide, recalées sur les centres.
         let gx = (ll.lon + 180.0) / span * side - 0.5;
@@ -129,10 +140,10 @@ impl DemStore {
         let ty = (gy - j0) as f32;
         let (i0, j0) = (i0 as i64, j0 as i64);
 
-        let v00 = self.pixel(i0, j0, ctx)?;
-        let v10 = self.pixel(i0 + 1, j0, ctx)?;
-        let v01 = self.pixel(i0, j0 + 1, ctx)?;
-        let v11 = self.pixel(i0 + 1, j0 + 1, ctx)?;
+        let v00 = self.pixel(i0, j0, zoom, ctx)?;
+        let v10 = self.pixel(i0 + 1, j0, zoom, ctx)?;
+        let v01 = self.pixel(i0, j0 + 1, zoom, ctx)?;
+        let v11 = self.pixel(i0 + 1, j0 + 1, zoom, ctx)?;
 
         let top = v00 + (v10 - v00) * tx;
         let bottom = v01 + (v11 - v01) * tx;

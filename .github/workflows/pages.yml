@@ -1,0 +1,76 @@
+name: Déploiement GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Droits requis par le déploiement Pages par artefact.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Un seul déploiement à la fois ; on laisse finir celui en cours.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `cargo test` compile la cible native, donc winit/glutin : sur un runner
+      # nu, ces dépendances système manquent. La cible wasm, elle, n'en a pas
+      # besoin.
+      - name: Dépendances système (build natif des tests)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev \
+            libxcursor-dev libgl1-mesa-dev
+
+      - name: Trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: latest
+
+      # Les tests réseau sont #[ignore] : la CI ne dépend ni d'Overpass ni de l'IGN.
+      - name: Tests
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --locked --target wasm32-unknown-unknown --all-targets -- -D warnings
+
+      # Le site est servi depuis /TrackFinder/ : sans --public-url, le HTML
+      # chercherait le .wasm à la racine du domaine et n'afficherait rien.
+      - name: Build
+        run: trunk build --release --public-url "/${GITHUB_REPOSITORY#*/}/"
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

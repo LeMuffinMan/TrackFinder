@@ -1,9 +1,11 @@
 mod app;
 mod dem;
 mod geo;
+mod graph;
 mod map;
 mod tiles;
 mod track;
+mod trails;
 
 use app::TrackFinderApp;
 
@@ -30,7 +32,7 @@ fn main() {
             .start(
                 canvas,
                 web_options,
-                Box::new(|cc| Ok(Box::new(TrackFinderApp::new(cc)))),
+                Box::new(|_cc| Ok(Box::new(TrackFinderApp::new()))),
             )
             .await
             .expect("echec du demarrage eframe");
@@ -43,6 +45,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "TrackFinder",
         eframe::NativeOptions::default(),
-        Box::new(|cc| Ok(Box::new(TrackFinderApp::new(cc)))),
+        Box::new(|_cc| Ok(Box::new(TrackFinderApp::new()))),
     )
 }

@@ -2,6 +2,7 @@
 
 use crate::dem::DemStore;
 use crate::geo::{haversine_m, lerp_latlon, LatLon};
+use crate::trails::{Snap, TrailNetwork};
 
 /// Pas d'échantillonnage du profil. 50 m est plus fin que le MNT (~5 m/px au
 /// zoom 14) sans faire exploser le nombre de tuiles demandées.
@@ -66,28 +67,79 @@ pub struct TrackStats {
     pub elevation_complete: bool,
 }
 
+/// Un point posé par l'utilisateur. `snap` est renseigné quand le point a été
+/// accroché à un sentier OSM — c'est lui qui permet le suivi de tronçon.
+#[derive(Clone, Debug)]
+pub struct Waypoint {
+    pub pos: LatLon,
+    pub snap: Option<Snap>,
+    /// Géométrie depuis le waypoint précédent, quand elle vient du graphe (M2).
+    /// Prioritaire sur le suivi de tronçon, qui ne sait relier que deux points
+    /// d'un même chemin OSM.
+    pub via: Option<Vec<LatLon>>,
+}
+
+impl Waypoint {
+    pub fn free(pos: LatLon) -> Self {
+        Self {
+            pos,
+            snap: None,
+            via: None,
+        }
+    }
+
+    pub fn snapped(snap: Snap) -> Self {
+        Self {
+            pos: snap.pos,
+            snap: Some(snap),
+            via: None,
+        }
+    }
+
+    pub fn routed(snap: Snap, via: Vec<LatLon>) -> Self {
+        Self {
+            pos: snap.pos,
+            snap: Some(snap),
+            via: Some(via),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Track {
-    pub points: Vec<LatLon>,
+    pub waypoints: Vec<Waypoint>,
+    /// Géométrie réellement parcourue : suit les sentiers entre deux waypoints
+    /// accrochés au même chemin OSM, ligne droite sinon (le routage arrive en M2).
+    path: Vec<LatLon>,
     profile: Vec<Sample>,
     stats: TrackStats,
     dirty: bool,
 }
 
 impl Track {
-    pub fn push(&mut self, ll: LatLon) {
-        self.points.push(ll);
+    pub fn push(&mut self, wp: Waypoint) {
+        self.waypoints.push(wp);
         self.dirty = true;
     }
 
     pub fn pop(&mut self) {
-        self.points.pop();
+        self.waypoints.pop();
         self.dirty = true;
     }
 
     pub fn clear(&mut self) {
-        self.points.clear();
+        self.waypoints.clear();
         self.dirty = true;
+    }
+
+    /// À appeler quand le réseau de sentiers a changé : un tronçon manquant
+    /// jusque-là peut désormais être suivi.
+    pub fn invalidate(&mut self) {
+        self.dirty = true;
+    }
+
+    pub fn path(&self) -> &[LatLon] {
+        &self.path
     }
 
     pub fn profile(&self) -> &[Sample] {
@@ -98,14 +150,46 @@ impl Track {
         &self.stats
     }
 
+    /// Nombre de liaisons suivant réellement un sentier.
+    pub fn followed_legs(&self, net: &TrailNetwork) -> usize {
+        self.waypoints
+            .windows(2)
+            .filter(|w| leg_geometry(net, &w[0], &w[1]).is_some())
+            .count()
+    }
+
+    fn rebuild_path(&mut self, net: &TrailNetwork) {
+        self.path.clear();
+        let Some(first) = self.waypoints.first() else {
+            return;
+        };
+        self.path.push(first.pos);
+        for pair in self.waypoints.windows(2) {
+            match leg_geometry(net, &pair[0], &pair[1]) {
+                // Le premier point de la géométrie est déjà dans `path`.
+                Some(geom) => self.path.extend(geom.into_iter().skip(1)),
+                None => self.path.push(pair[1].pos),
+            }
+        }
+    }
+
     /// Recalcule si nécessaire. Tant que le MNT n'est pas complet on recalcule à
     /// chaque frame : les tuiles arrivent au fil de l'eau et complètent le profil.
-    pub fn refresh(&mut self, dem: &mut DemStore, settings: &WalkSettings, ctx: &egui::Context) {
+    pub fn refresh(
+        &mut self,
+        net: &TrailNetwork,
+        dem: &mut DemStore,
+        settings: &WalkSettings,
+        ctx: &egui::Context,
+    ) {
         if !self.dirty && self.stats.elevation_complete {
             return;
         }
+        if self.dirty {
+            self.rebuild_path(net);
+        }
         self.dirty = false;
-        self.profile = sample_polyline(&self.points);
+        self.profile = sample_polyline(&self.path);
         let mut complete = true;
         for s in &mut self.profile {
             s.elev_m = dem.elevation(s.pos, ctx);
@@ -118,6 +202,14 @@ impl Track {
     pub fn recompute_time(&mut self, settings: &WalkSettings) {
         self.stats = compute_stats(&self.profile, settings, self.stats.elevation_complete);
     }
+}
+
+/// Géométrie d'une liaison entre deux waypoints, si elle suit un sentier connu.
+fn leg_geometry(net: &TrailNetwork, a: &Waypoint, b: &Waypoint) -> Option<Vec<LatLon>> {
+    if let Some(via) = &b.via {
+        return Some(via.clone());
+    }
+    net.follow(a.snap.as_ref()?, b.snap.as_ref()?)
 }
 
 /// Découpe la polyligne en points espacés d'environ `STEP_M`, sommets compris.
@@ -304,5 +396,72 @@ mod tests {
     fn duree_formatee() {
         assert_eq!(format_duration(2.5), "2 h 30");
         assert_eq!(format_duration(0.0), "—");
+    }
+}
+
+/// Intégration M0 + M1 sans interface : Overpass → snap → suivi de tronçon →
+/// MNT → Naismith. `cargo test -- --ignored`.
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod integration {
+    use super::*;
+    use crate::dem::DemStore;
+    use crate::tiles::HttpTileSource;
+    use crate::trails::{tests::fetch_zone_blocking, TrailNetwork, ZoneKey, SNAP_RADIUS_M};
+    use std::rc::Rc;
+
+    #[test]
+    #[ignore = "réseau"]
+    fn etape_reelle_a_chamonix() {
+        let ctx = egui::Context::default();
+        let zone = ZoneKey::of(LatLon::new(45.92, 6.87));
+        let mut net = TrailNetwork::default();
+        for way in fetch_zone_blocking(zone).unwrap() {
+            net.insert(way);
+        }
+
+        // Deux points pris sur un même chemin OSM long : le tracé doit suivre sa
+        // géométrie, pas la corde.
+        let way = net
+            .ways()
+            .iter()
+            .max_by_key(|w| w.points.len())
+            .expect("réseau non vide");
+        let (a_pos, b_pos) = (way.points[1], way.points[way.points.len() - 2]);
+        let way_id = way.id;
+
+        let a = net.snap(a_pos, SNAP_RADIUS_M).unwrap();
+        let b = net.snap(b_pos, SNAP_RADIUS_M).unwrap();
+        assert_eq!((a.way_id, b.way_id), (way_id, way_id));
+
+        let mut track = Track::default();
+        track.push(Waypoint::snapped(a));
+        track.push(Waypoint::snapped(b));
+
+        let settings = WalkSettings::default();
+        let mut dem = DemStore::new(Rc::new(HttpTileSource::default()));
+
+        // Les tuiles MNT arrivent de façon asynchrone : on tourne comme le ferait
+        // la boucle de rendu jusqu'à ce que le profil soit complet.
+        for _ in 0..200 {
+            dem.begin_frame();
+            track.refresh(&net, &mut dem, &settings, &ctx);
+            if track.stats().elevation_complete {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let stats = *track.stats();
+        assert!(stats.elevation_complete, "MNT incomplet après 10 s");
+        assert!(track.path().len() > 2, "le tracé doit suivre la géométrie");
+        assert!(stats.distance_m > 0.0);
+        assert!(
+            (500.0..4500.0).contains(&stats.min_elev_m.unwrap()),
+            "altitude hors des Alpes : {:?}",
+            stats.min_elev_m
+        );
+        assert!(stats.time_h > 0.0);
+        assert_eq!(track.followed_legs(&net), 1);
     }
 }
