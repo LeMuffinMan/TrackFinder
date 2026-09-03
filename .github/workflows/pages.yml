@@ -51,7 +51,11 @@ jobs:
       - name: Tests
         run: cargo test --locked
 
+      # Informatif, jamais bloquant : clippy suit la version stable du runner et
+      # gagne des règles à chaque sortie. Un lint neuf ne doit pas empêcher un
+      # déploiement — les tests, eux, restent bloquants.
       - name: Clippy
+        continue-on-error: true
         run: cargo clippy --locked --target wasm32-unknown-unknown --all-targets -- -D warnings
 
       # Le site est servi depuis /TrackFinder/ : sans --public-url, le HTML

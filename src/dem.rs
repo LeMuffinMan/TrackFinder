@@ -63,10 +63,8 @@ pub fn decode_bil(bytes: &[u8]) -> Result<DemTile, String> {
             raw.len()
         ));
     }
-    let values = raw
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
+    let (quads, _) = raw.as_chunks::<4>();
+    let values = quads.iter().copied().map(f32::from_le_bytes).collect();
     Ok(DemTile { values })
 }
 
