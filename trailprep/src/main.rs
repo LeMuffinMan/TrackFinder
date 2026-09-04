@@ -7,8 +7,9 @@
 //!     rhone-alpes-latest.osm.pbf provence-alpes-cote-d-azur-latest.osm.pbf
 //! ```
 //!
-//! `--out` is a **directory**: one file per tile plus an index. See `trailfmt`
-//! for why a single archive addressed by byte ranges had to be abandoned.
+//! `--out` is a **directory**: one file per tile, an index, and a `region.json`
+//! fragment for the manifest. See `trailfmt` for why a single archive addressed
+//! by byte ranges had to be abandoned.
 //!
 //! ## Why three passes
 //!
@@ -287,9 +288,11 @@ fn main() {
             bbox.east
         )
     );
-    let mut fragment_path = out.clone().into_os_string();
-    fragment_path.push(".json");
-    std::fs::write(&fragment_path, &fragment).expect("cannot write the manifest fragment");
+    // Inside the region directory, not beside it: everything a region needs
+    // travels together, so the whole `data/trails` tree can be copied into the
+    // build output in one move.
+    std::fs::write(out.join("region.json"), &fragment)
+        .expect("cannot write the manifest fragment");
 
     verify(&out, zoom, &published, kept, total_points);
 

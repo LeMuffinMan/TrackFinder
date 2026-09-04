@@ -41,8 +41,9 @@ const ZOOM_SETTLE_MS: u128 = 130;
 const LEVEL_CROSSFADE_MS: u128 = 500;
 
 /// How long the view has to be still before background data (trails) is fetched
-/// for it. Much longer than the tile delay: an Overpass request is expensive and
-/// rate limited, a tile is not.
+/// for it. Longer than the tile delay: a drag would otherwise ask for a fresh
+/// disc of trail tiles on every frame, and most of them would be thrown away
+/// before they arrived.
 const VIEW_SETTLE_MS: u128 = 500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

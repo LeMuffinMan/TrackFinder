@@ -9,13 +9,14 @@ use crate::map::{self, MapView, TileRenderer, MAX_TILE_REQUESTS};
 use crate::terrain::{self, TerrainAnalysis};
 use crate::tiles::{HttpTileSource, RasterLayer, TileSource};
 use crate::track::{format_duration, Track, WalkSettings, Waypoint};
-use crate::trails::{Snap, TrailStore, ZoneKey, SNAP_RADIUS_M};
+use crate::archive::TrailArchive;
+use crate::trails::{Snap, TrailNetwork, SNAP_RADIUS_M};
 
 /// The French Alps, from Lake Geneva down to the Mercantour.
 ///
 /// The application opens on the whole range rather than on one valley: you pick
-/// the massif first, then zoom in. Deliberately below `AUTO_TRAILS_MIN_ZOOM`, so
-/// simply opening the page asks Overpass for nothing.
+/// the massif first, then zoom in. Deliberately below `TRAILS_MIN_ZOOM`, so
+/// opening the page draws no network and fetches no trail tile.
 const ALPS_SW: LatLon = LatLon::new(43.95, 5.35);
 const ALPS_NE: LatLon = LatLon::new(46.45, 7.75);
 
@@ -27,32 +28,90 @@ const BASE_MAPS: [RasterLayer; 2] = [RasterLayer::PlanIgn, RasterLayer::Ortho];
 /// polylines collapse into an unreadable smear that costs milliseconds a frame.
 const TRAILS_MIN_ZOOM: u8 = 12;
 
-/// Below this zoom trails are not auto-loaded either. A wide view spans hundreds
-/// of Overpass zones, and Overpass is a public, quota-limited service.
-const AUTO_TRAILS_MIN_ZOOM: u8 = 13;
+/// Trails loaded around the last point of the track, in metres.
+///
+/// Generous on purpose: the point of placing a point is to plan a whole leg from
+/// it, seeing where the trails go without zooming around to make them load. At
+/// ~250 points/km² this is a few megabytes of static tiles, fetched in parallel.
+const LEG_RADIUS_M: f64 = 30_000.0;
 
-/// Ceiling on the zones one view may request at once, automatically or not.
-const MAX_VISIBLE_ZONES: usize = 12;
+/// Trails loaded around the view while no point is placed yet.
+///
+/// Smaller: at this stage the network is only a cue for where one may usefully
+/// click, not the ground a leg will be planned on.
+const VIEW_RADIUS_M: f64 = 8_000.0;
 
-/// New basin zones requested per settled frame. Overpass grants two slots; more
-/// than a trickle only builds a queue.
-const BASIN_STEP: usize = 2;
+/// Trails a click needs before it can snap.
+///
+/// The tile holding the click is almost always enough — they are ~13 km across
+/// and the snap radius is 60 m — but a click near a tile edge needs its
+/// neighbour too.
+const CLICK_RADIUS_M: f64 = 500.0;
 
-/// Hard ceiling on the zones one basin may ever request. A 10 h budget would
-/// otherwise sweep sixty coarse zones off a public service.
-const MAX_BASIN_ZONES: usize = 16;
+/// How much of the network to draw, independently of the map zoom.
+///
+/// ⚠️ **A display control, deliberately — it changes nothing that is loaded, and
+/// nothing that is computed.** Two alternatives were considered and rejected:
+///
+/// - *simplifying the geometry in the archive*: Douglas-Peucker cuts the
+///   switchbacks, distances shorten by a few percent and Naismith turns
+///   optimistic. Weighted walking time is the core of this application; trading
+///   its accuracy for bytes is a bad deal.
+/// - *fetching fewer bytes at low detail*: that means separate files per level,
+///   so changing the slider refetches, and routing would have to keep the full
+///   geometry anyway — the saving evaporates.
+///
+/// What is left is what the eye actually needs: fewer classes, and a coarser
+/// screen-space decimation. Both act at the current zoom, both are instant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Detail {
+    /// Hiking ways only, heavily decimated: the shape of the network.
+    Sparse,
+    /// Everything off-tarmac.
+    Normal,
+    /// Roads and streets included, near-full geometry.
+    Full,
+}
 
-/// Bootstrap radius before any isochrone exists, in metres — enough to give the
-/// graph something to expand into.
-const BASIN_BOOTSTRAP_M: f64 = 5_000.0;
+impl Detail {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sparse => "Paths only",
+            Self::Normal => "Off-road",
+            Self::Full => "Everything",
+        }
+    }
 
-/// Margin added beyond the reach the isochrone actually achieved, so the next
-/// ring of trails can extend it. One coarse zone.
-const BASIN_MARGIN_M: f64 = 11_000.0;
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Sparse => "hiking ways, simplified — the shape of the network",
+            Self::Normal => "adds tracks and cycleways",
+            Self::Full => "adds roads and streets, near-full geometry",
+        }
+    }
 
-/// Squared screen distance below which a shape point is dropped when drawing the
-/// network. Two points inside the same pixel draw the same line twice.
-const MIN_SEGMENT_PX2: f32 = 4.0;
+    fn draws(self, kind: crate::trails::WayKind) -> bool {
+        match self {
+            Self::Sparse => kind.is_hiking(),
+            Self::Normal => kind.is_offroad(),
+            Self::Full => true,
+        }
+    }
+
+    /// Squared screen distance below which a shape point is dropped.
+    ///
+    /// An OSM way holds a point every few metres; zoomed out that is dozens of
+    /// vertices inside one pixel, all of them tessellated for nothing. Raising
+    /// the threshold trades fidelity for a cleaner, cheaper map — at whatever
+    /// zoom the map happens to be.
+    fn min_segment_px2(self) -> f32 {
+        match self {
+            Self::Sparse => 36.0,
+            Self::Normal => 9.0,
+            Self::Full => 2.25,
+        }
+    }
+}
 
 /// A transparent layer composited over the base map.
 struct OverlaySetting {
@@ -70,7 +129,10 @@ pub struct TrackFinderApp {
     /// The single ground layer. Always one of `BASE_MAPS`.
     base: RasterLayer,
     overlays: Vec<OverlaySetting>,
-    trails: TrailStore,
+    /// Where the trails come from: static tiles on the same origin.
+    archive: TrailArchive,
+    /// The trails themselves. Owned here now that no store owns them.
+    net: TrailNetwork,
     graph: Graph,
     /// The network changed: the graph has to be rebuilt.
     graph_dirty: bool,
@@ -86,14 +148,8 @@ pub struct TrackFinderApp {
     pending_click: Option<LatLon>,
     snap_to_trail: bool,
     show_trails: bool,
-    /// Load the visible trails on their own once the view stops moving.
-    auto_load_trails: bool,
-    /// Last (centre zone, zoom) already scanned for auto-loading — panning
-    /// inside one zone must not rescan on every settled frame. Only used while
-    /// no point is placed; after that the basin takes over.
-    last_auto_scan: Option<(ZoneKey, u8)>,
-    /// Progressive loading of the basin around the last point.
-    basin: Option<Basin>,
+    /// How much of the network to draw — independent of the map zoom.
+    detail: Detail,
     hover: Option<(LatLon, Option<f32>)>,
     status: Option<String>,
     /// The bivouac candidate: always the last point of the track.
@@ -147,7 +203,8 @@ impl TrackFinderApp {
                     opacity: 0.8,
                 },
             ],
-            trails: TrailStore::overpass(),
+            archive: TrailArchive::default(),
+            net: TrailNetwork::default(),
             graph: Graph::default(),
             graph_dirty: false,
             graph_elevated: false,
@@ -158,9 +215,7 @@ impl TrackFinderApp {
             pending_click: None,
             snap_to_trail: true,
             show_trails: true,
-            auto_load_trails: true,
-            last_auto_scan: None,
-            basin: None,
+            detail: Detail::Normal,
             hover: None,
             status: None,
             bivouac: None,
@@ -184,7 +239,7 @@ impl TrackFinderApp {
         let ctx = ui.ctx().clone();
         self.renderer.begin_frame(&ctx);
         self.dem.begin_frame(&ctx);
-        if self.trails.pump(&ctx) {
+        if self.archive.pump(&mut self.net) {
             // New trails may complete legs that are already placed.
             self.track.invalidate();
             self.graph_dirty = true;
@@ -199,7 +254,7 @@ impl TrackFinderApp {
 
         self.map_area(ui, &ctx);
         // After the map, so the view rectangle of this very frame is known.
-        self.update_auto_trails(&ctx);
+        self.load_trails(&ctx);
 
         self.renderer.end_frame();
         self.dem.end_frame();
@@ -226,7 +281,7 @@ impl TrackFinderApp {
             if let Some(pos) = response.interact_pointer_pos() {
                 let ll = self.view.screen_to_latlon(pos, rect);
                 if self.snap_to_trail {
-                    self.trails.ensure(ll, ctx);
+                    self.archive.ensure_area(ll, CLICK_RADIUS_M, ctx);
                     self.pending_click = Some(ll);
                     self.status = None;
                 } else {
@@ -272,7 +327,7 @@ impl TrackFinderApp {
         }
         self.paint_isochrone(&painter, rect);
         self.track
-            .refresh(&self.trails.net, &mut self.dem, &self.walk, ctx);
+            .refresh(&self.net, &mut self.dem, &self.walk, ctx);
         self.paint_track(&painter, rect);
         self.paint_bivouac(&painter, rect);
         self.paint_scale_bar(&painter, rect);
@@ -291,9 +346,10 @@ impl TrackFinderApp {
         let sw = self.view.screen_to_latlon(rect.left_bottom(), rect);
         let ne = self.view.screen_to_latlon(rect.right_top(), rect);
         let view = (sw.lat, sw.lon, ne.lat, ne.lon);
+        let min_px2 = self.detail.min_segment_px2();
         let mut pts: Vec<Pos2> = Vec::with_capacity(64);
-        for way in self.trails.net.ways() {
-            if !way.intersects(view) {
+        for way in self.net.ways() {
+            if !way.intersects(view) || !self.detail.draws(way.kind) {
                 continue;
             }
             pts.clear();
@@ -305,7 +361,7 @@ impl TrackFinderApp {
                 let keep = i == last
                     || pts
                         .last()
-                        .is_none_or(|prev| (p - *prev).length_sq() >= MIN_SEGMENT_PX2);
+                        .is_none_or(|prev| (p - *prev).length_sq() >= min_px2);
                 if keep {
                     pts.push(p);
                 }
@@ -394,16 +450,17 @@ impl TrackFinderApp {
         let Some(ll) = self.pending_click else {
             return;
         };
-        if let Some(err) = self.trails.zone_failed(ll) {
-            self.status = Some(format!("Trails unavailable: {err}"));
+        // The manifest has to be here before we can say anything at all.
+        if self.archive.ready() && !self.archive.covers(ll) {
+            self.status = Some("Outside the mapped area — the Alps only".to_owned());
             self.pending_click = None;
             return;
         }
-        if !self.trails.zone_ready(ll) {
+        if !self.archive.area_ready(ll, CLICK_RADIUS_M) {
             return;
         }
         self.pending_click = None;
-        let Some(snap) = self.trails.net.snap(ll, SNAP_RADIUS_M) else {
+        let Some(snap) = self.net.snap(ll, SNAP_RADIUS_M) else {
             self.status = Some(format!(
                 "No trail within {SNAP_RADIUS_M:.0} m — point refused"
             ));
@@ -468,37 +525,52 @@ impl TrackFinderApp {
             }
 
             ui.separator();
-            ui.strong("Trails (OpenStreetMap)");
+            ui.strong("Trails");
             ui.checkbox(&mut self.show_trails, "Show the network");
             ui.checkbox(&mut self.snap_to_trail, "Snap points to trails");
-            ui.checkbox(&mut self.auto_load_trails, "Load them automatically");
-            let (zones, pending, failed, ways) = self.trails.stats();
-            ui.monospace(format!("{zones} zones · {ways} ways"));
-            if let Some((text, _)) = self.basin_status() {
-                ui.monospace(text);
+            if self.show_trails {
+                ui.horizontal(|ui| {
+                    ui.label("Detail");
+                    for level in [Detail::Sparse, Detail::Normal, Detail::Full] {
+                        ui.selectable_value(&mut self.detail, level, level.label())
+                            .on_hover_text(level.hint());
+                    }
+                });
+                ui.weak(self.detail.hint());
             }
-            if let Some(hint) = self.auto_trails_hint() {
-                ui.weak(hint);
-            }
-            if pending > 0 {
+            let (settled, loading, regions) = self.archive.stats();
+            if regions == 0 {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(format!("{pending} zone(s) loading"));
+                    ui.label("loading the trail index…");
+                });
+            } else {
+                ui.monospace(format!("{settled} tiles · {} ways", self.net.len()));
+                // The deployment only carries some massifs, so say plainly where
+                // it has data. Outside them nothing can be placed at all, and a
+                // silent empty map would look like a bug.
+                let here = self
+                    .track
+                    .waypoints
+                    .last()
+                    .map(|wp| wp.pos)
+                    .unwrap_or_else(|| self.view.center_latlon());
+                match self.archive.manifest().region_for(here) {
+                    Some(region) => ui.weak(region.name.clone()),
+                    None => ui.colored_label(
+                        Color32::from_rgb(200, 150, 60),
+                        "no trail data here — this build covers the Alps only",
+                    ),
+                };
+            }
+            if loading > 0 {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("{loading} tile(s) loading"));
                 });
             }
-            if failed > 0 {
-                ui.colored_label(
-                    Color32::from_rgb(200, 90, 90),
-                    format!("{failed} zone(s) failed"),
-                );
-                if ui.button("Retry").clicked() {
-                    let ctx = ui.ctx().clone();
-                    self.trails.retry_failed(&ctx);
-                }
-            }
-            if ui.button("Load the trails in view").clicked() {
-                let ctx = ui.ctx().clone();
-                self.load_visible_zones(&ctx, true);
+            if let Some(e) = &self.archive.last_error {
+                ui.colored_label(Color32::from_rgb(200, 90, 90), format!("Trails: {e}"));
             }
             if let Some(status) = &self.status {
                 ui.weak(status);
@@ -542,10 +614,10 @@ impl TrackFinderApp {
                         iso.edges.len()
                     ));
                     ui.monospace(format!("furthest  {:.1} km away", iso.reach_m / 1000.0));
-                    // An isochrone computed on a partial basin does not look
-                    // partial: it stops at the edge of the data and reads as
-                    // "not reachable". Say so rather than let it mislead.
-                    if self.basin_status().is_some_and(|(_, partial)| partial) {
+                    // An isochrone computed on partly loaded ground does not
+                    // look partial: it stops at the edge of the data and reads
+                    // as "not reachable". Say so rather than let it mislead.
+                    if self.archive.stats().1 > 0 {
                         ui.colored_label(
                             Color32::from_rgb(200, 150, 60),
                             "! trails still loading — reach shown is a lower bound",
@@ -556,14 +628,6 @@ impl TrackFinderApp {
                     ui.weak("last point is off the graph");
                 }
                 None => {}
-            }
-            if ui
-                .button("Load the isochrone basin")
-                .on_hover_text("Large Overpass zones around the last point")
-                .clicked()
-            {
-                let ctx = ui.ctx().clone();
-                self.load_isochrone_area(&ctx);
             }
 
             ui.separator();
@@ -638,7 +702,7 @@ impl TrackFinderApp {
             ui.monospace(format!("duration  {}", format_duration(stats.time_h)));
             let legs = self.track.waypoints.len().saturating_sub(1);
             if legs > 0 {
-                let followed = self.track.followed_legs(&self.trails.net);
+                let followed = self.track.followed_legs(&self.net);
                 ui.monospace(format!("on trail  {followed}/{legs} legs"));
             }
             if !self.track.waypoints.is_empty() && !stats.elevation_complete {
@@ -684,20 +748,10 @@ impl TrackFinderApp {
                 ));
                 ui.monospace(format!("scale   {:.1} m/px", self.view.meters_per_pixel()));
                 ui.monospace(format!("track points {}", self.track.path().len()));
-                if let Some(url) = self.trails.preferred_endpoint() {
-                    // First thing to look at when trail loading drags: a dead
-                    // primary is invisible otherwise.
-                    let host = url
-                        .trim_start_matches("https://")
-                        .split('/')
-                        .next()
-                        .unwrap_or(&url)
-                        .to_owned();
-                    ui.monospace(format!("trails  via {host}"));
-                }
-                if let Some(e) = &self.trails.last_error {
-                    ui.colored_label(Color32::from_rgb(200, 90, 90), format!("Overpass: {e}"));
-                }
+                let (settled, loading, regions) = self.archive.stats();
+                ui.monospace(format!(
+                    "trails  {settled} tiles settled · {loading} loading · {regions} region(s)"
+                ));
             }
         });
     }
@@ -782,232 +836,34 @@ impl TrackFinderApp {
 // ---------------------------------------------------------------------------
 
 impl TrackFinderApp {
-    /// Why automatic loading is currently doing nothing, if it is not.
-    fn auto_trails_hint(&self) -> Option<&'static str> {
-        if !self.auto_load_trails {
-            return None;
-        }
-        // Once a point is placed the basin drives loading and the view zoom no
-        // longer gates anything.
-        if !self.track.waypoints.is_empty() {
-            return None;
-        }
-        (self.view.tile_zoom() < AUTO_TRAILS_MIN_ZOOM)
-            .then_some("zoom in to z13 to load trails automatically")
-    }
-
-    /// Loads trails on its own once the view has stopped moving.
+    /// Keeps the trails around the working point loaded.
     ///
     /// **The anchor is the last point of the track, not the viewport.** What the
-    /// application needs is the network the isochrone can reach from where you
-    /// stand; the visible rectangle is a poor proxy for that — you can pan away
-    /// to read the map and load zones you will never route through, while the
-    /// basin you actually depend on stays half loaded. Worse, a half-loaded basin
-    /// makes the isochrone *wrong without saying so*: it stops at the edge of the
-    /// data and reads as "not reachable in 3 h".
+    /// application needs is the ground a leg will be planned on; the visible
+    /// rectangle is a poor proxy — you can pan away to read the map while the
+    /// area you actually depend on stays half loaded.
     ///
-    /// Before the first point there is no anchor, so the viewport is all we have
-    /// — and there the network is only a cue for where one may click.
+    /// Before the first point there is no anchor, so the view is all we have,
+    /// and a smaller radius: at that stage the network is only a cue for where
+    /// one may usefully click.
     ///
-    /// The view has to be **settled** either way: Overpass allows two requests at
-    /// a time, and a drag would otherwise queue a zone per frame.
-    fn update_auto_trails(&mut self, ctx: &egui::Context) {
-        if !self.auto_load_trails
-            || self.last_map_rect == Rect::NOTHING
-            || !self.view.view_settled()
-        {
-            return;
-        }
+    /// No queue, no pacing, no zoom gate on the anchored path. These are static
+    /// tiles behind a CDN and `ensure_area` already skips everything settled or
+    /// in flight; holding them back would only make the map slower.
+    fn load_trails(&mut self, ctx: &egui::Context) {
         match self.track.waypoints.last().map(|wp| wp.pos) {
-            Some(anchor) => self.grow_basin(anchor, ctx),
-            None => self.scan_visible_zones(ctx),
-        }
-    }
-
-    /// Viewport scan, used only while no point is placed.
-    ///
-    /// Keyed on the centre zone plus the zoom, so panning inside one zone does
-    /// not re-walk the grid sixty times a second for an answer that cannot have
-    /// changed.
-    fn scan_visible_zones(&mut self, ctx: &egui::Context) {
-        let z = self.view.tile_zoom();
-        if z < AUTO_TRAILS_MIN_ZOOM {
-            return;
-        }
-        let key = (ZoneKey::of(self.view.center_latlon()), z);
-        if self.last_auto_scan == Some(key) {
-            return;
-        }
-        self.last_auto_scan = Some(key);
-        self.load_visible_zones(ctx, false);
-    }
-
-    /// Grows the trail basin around `anchor`, a couple of zones at a time, until
-    /// the isochrone stops growing.
-    ///
-    /// The loop is: load a ring → the graph reaches further → the radius derived
-    /// from that reach grows → load the next ring. It converges on its own, and
-    /// on ground where the isochrone is bounded by climb rather than by data it
-    /// converges quickly — which is most of the Alps.
-    ///
-    /// Nothing is asked while zones are still in flight: the answer to "did that
-    /// help?" only exists once they have landed.
-    fn grow_basin(&mut self, anchor: LatLon, ctx: &egui::Context) {
-        if self.basin.as_ref().is_none_or(|b| b.anchor != anchor) {
-            self.basin = Some(Basin::new(anchor));
-        }
-        let Some(basin) = self.basin.as_ref() else {
-            return;
-        };
-        // Done deciding: the counters were made accurate before `complete` was
-        // set, so there is nothing left to recompute every frame.
-        if basin.complete || basin.asked >= MAX_BASIN_ZONES {
-            return;
-        }
-        // Zones already on the wire: wait for them before deciding anything.
-        if self.trails.stats().1 > 0 {
-            return;
-        }
-
-        // Measure first, decide second. Refreshing the readout before any early
-        // return is what keeps the panel from freezing on stale figures at the
-        // exact moment the basin settles.
-        let reach_m = self.iso.as_ref().map(|i| i.reach_m).unwrap_or(0.0);
-        let theoretical = self.budget_h as f64 * self.walk.flat_kmh * 1000.0;
-        let radius = (reach_m + BASIN_MARGIN_M)
-            .max(BASIN_BOOTSTRAP_M)
-            .min(theoretical.max(BASIN_BOOTSTRAP_M));
-        let keys = self.trails.area_zones(anchor, radius);
-        let loaded = self.trails.zones_loaded(&keys);
-
-        let Some(basin) = self.basin.as_mut() else {
-            return;
-        };
-        basin.radius_m = radius;
-        basin.zones = keys.len();
-        basin.loaded = loaded;
-
-        // Converged: the last batch landed and the isochrone did not get any
-        // further. More data would not change the answer.
-        if basin.asked > 0 && reach_m <= basin.reach_at_last_ask + 1.0 {
-            basin.complete = true;
-            return;
-        }
-        basin.reach_at_last_ask = reach_m;
-        let budget = BASIN_STEP.min(MAX_BASIN_ZONES - basin.asked);
-        let asked = self.trails.ensure_some(&keys, budget, ctx);
-
-        let Some(basin) = self.basin.as_mut() else {
-            return;
-        };
-        if asked == 0 {
-            // Everything within the radius is in memory and the isochrone has
-            // nothing left to eat.
-            basin.complete = true;
-        } else {
-            basin.asked += asked;
-        }
-    }
-
-    /// What to tell the user about basin coverage, if anything.
-    ///
-    /// An isochrone computed on a partial basin is not merely incomplete, it is
-    /// misleading — so this is said plainly rather than left to a spinner.
-    fn basin_status(&self) -> Option<(String, bool)> {
-        let basin = self.basin.as_ref()?;
-        // "Partial" means the basin is still working — **not** that every
-        // candidate zone is loaded. It stops as soon as more data stops moving
-        // the isochrone, which normally happens well before the outer ring is
-        // fetched: those zones were candidates, never requirements.
-        let text = format!(
-            "basin {} zones · {:.0} km around the last point{}",
-            basin.loaded,
-            basin.radius_m / 1000.0,
-            if basin.complete { "" } else { " · growing" }
-        );
-        Some((text, !basin.complete))
-    }
-
-    /// Requests the trail zones covering the current view, capped: a zoomed-out
-    /// view spans hundreds of zones and Overpass is a public quota-limited
-    /// service.
-    ///
-    /// `announce` writes to the status line — the button says what it did, the
-    /// automatic path stays silent.
-    fn load_visible_zones(&mut self, ctx: &egui::Context, announce: bool) {
-        let rect = self.last_map_rect;
-        if rect == Rect::NOTHING {
-            return;
-        }
-        let sw = self.view.screen_to_latlon(rect.left_bottom(), rect);
-        let ne = self.view.screen_to_latlon(rect.right_top(), rect);
-        let center = self.view.center_latlon();
-        let keys = self
-            .trails
-            .zones_covering(sw.lat, sw.lon, ne.lat, ne.lon, center);
-        let total = keys.len();
-        let asked = self.trails.ensure_zones(&keys, MAX_VISIBLE_ZONES, ctx);
-        if announce {
-            self.status = Some(if total > MAX_VISIBLE_ZONES {
-                format!(
-                    "View too wide: {MAX_VISIBLE_ZONES} of {total} zones requested, zoom in for the rest"
-                )
-            } else if asked == 0 {
-                "Visible trails already loaded".to_owned()
-            } else {
-                format!("{asked} zone(s) requested")
-            });
-        }
-    }
-
-    /// Loads the trails of the basin the isochrone can reach. The radius is an
-    /// upper bound: as the crow flies you never beat the flat speed, so
-    /// `budget × speed` bounds the isochrone by construction.
-    fn load_isochrone_area(&mut self, ctx: &egui::Context) {
-        const MAX_ZONES: usize = 9;
-        let Some(center) = self.track.waypoints.last().map(|w| w.pos).or_else(|| {
-            (self.last_map_rect != Rect::NOTHING).then(|| self.view.center_latlon())
-        }) else {
-            return;
-        };
-        let radius_m = self.budget_h as f64 * self.walk.flat_kmh * 1000.0;
-        let asked = self.trails.ensure_area(center, radius_m, MAX_ZONES, ctx);
-        self.status = Some(if asked == 0 {
-            "Basin already loaded".to_owned()
-        } else {
-            format!(
-                "{asked} zone(s) requested over a ~{:.0} km radius",
-                radius_m / 1000.0
-            )
-        });
-    }
-}
-
-/// Progressive loading of the trail basin around the last point of the track.
-struct Basin {
-    anchor: LatLon,
-    /// Zones actually requested for this anchor, against `MAX_BASIN_ZONES`.
-    asked: usize,
-    /// Zones the current radius covers, and how many are in memory.
-    zones: usize,
-    loaded: usize,
-    radius_m: f64,
-    /// Isochrone reach when zones were last requested — the growth test.
-    reach_at_last_ask: f64,
-    /// The isochrone stopped growing, or everything in radius is loaded.
-    complete: bool,
-}
-
-impl Basin {
-    fn new(anchor: LatLon) -> Self {
-        Self {
-            anchor,
-            asked: 0,
-            zones: 0,
-            loaded: 0,
-            radius_m: 0.0,
-            reach_at_last_ask: 0.0,
-            complete: false,
+            Some(anchor) => self.archive.ensure_area(anchor, LEG_RADIUS_M, ctx),
+            None => {
+                // Only once the view stops moving: a drag would otherwise ask
+                // for a fresh disc of tiles on every frame.
+                if self.last_map_rect != Rect::NOTHING
+                    && self.view.view_settled()
+                    && self.view.tile_zoom() >= TRAILS_MIN_ZOOM
+                {
+                    let center = self.view.center_latlon();
+                    self.archive.ensure_area(center, VIEW_RADIUS_M, ctx);
+                }
+            }
         }
     }
 }
@@ -1037,13 +893,13 @@ impl TrackFinderApp {
     /// arrive, then recomputes the isochrone if needed.
     fn update_graph(&mut self, ctx: &egui::Context) {
         if self.graph_dirty {
-            self.graph = Graph::build(&self.trails.net);
+            self.graph = Graph::build(&self.net);
             self.graph_dirty = false;
             self.graph_elevated = false;
             self.iso_dirty = true;
         }
         if !self.graph.is_empty() && !self.graph_elevated {
-            self.graph_elevated = self.graph.update_elevations(&self.trails.net, &mut self.dem, ctx);
+            self.graph_elevated = self.graph.update_elevations(&self.net, &mut self.dem, ctx);
             if self.graph_elevated {
                 // Costs change once the climb is known: the isochrone shown until
                 // now was optimistic.
@@ -1061,7 +917,7 @@ impl TrackFinderApp {
             return None;
         }
         let source = self.track.waypoints.last()?.snap?;
-        let source_pos = self.graph.locate(&self.trails.net, &source)?;
+        let source_pos = self.graph.locate(&self.net, &source)?;
         let budget_ms = (self.budget_h as f64 * 3_600_000.0) as CostMs;
         let reach = self.graph.explore(
             &self.graph.sources_from(&source_pos, &self.walk),
@@ -1087,10 +943,10 @@ impl TrackFinderApp {
     /// point is inside the isochrone.
     fn route_to(&self, target: &Snap) -> Option<Vec<LatLon>> {
         let iso = self.iso.as_ref()?;
-        let target_pos = self.graph.locate(&self.trails.net, target)?;
+        let target_pos = self.graph.locate(&self.net, target)?;
         let r = graph::route(
             &self.graph,
-            &self.trails.net,
+            &self.net,
             &iso.reach,
             (&iso.source, &iso.source_pos),
             (target, &target_pos),
@@ -1112,7 +968,7 @@ impl TrackFinderApp {
 
         for (edge_idx, cost) in &iso.edges {
             let edge = &self.graph.edges[*edge_idx as usize];
-            let Some(way) = self.trails.net.way_by_id(edge.way_id) else {
+            let Some(way) = self.net.way_by_id(edge.way_id) else {
                 continue;
             };
             if !way.intersects(view) {
@@ -1296,48 +1152,6 @@ mod tests {
 
     const CHAMONIX: LatLon = LatLon::new(45.92, 6.87);
 
-    /// Overpass is a public service: it goes down, it throttles, it times out. A
-    /// network test failing on that teaches nothing — report and bail out.
-    /// The patience covers the whole endpoint-switching chain (3 × 20 s).
-    const PATIENCE: u32 = 700;
-
-    fn unavailable(app: &TrackFinderApp) -> bool {
-        let (_, _, failed, _) = app.trails.stats();
-        failed > 0
-    }
-
-    /// Spins the loop until the pending click resolves. Returns false when
-    /// Overpass gave nothing — up to the test to declare itself skipped.
-    #[must_use]
-    fn pump_until(app: &mut TrackFinderApp, ctx: &egui::Context) -> bool {
-        for _ in 0..PATIENCE {
-            app.trails.pump(ctx);
-            app.resolve_pending_click(ctx);
-            if app.pending_click.is_none() {
-                return !unavailable(app);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        false
-    }
-
-    /// Places a point the way a click on the map would.
-    #[must_use]
-    fn click(app: &mut TrackFinderApp, ll: LatLon, ctx: &egui::Context) -> bool {
-        app.trails.ensure(ll, ctx);
-        app.pending_click = Some(ll);
-        pump_until(app, ctx)
-    }
-
-    macro_rules! skip_if_offline {
-        ($ok:expr) => {
-            if !$ok {
-                eprintln!("Overpass unavailable — test skipped");
-                return;
-            }
-        };
-    }
-
     // -----------------------------------------------------------------------
     // Performance measurement, headless: the same path eframe takes
     // (`Context::run_ui`), tessellation included.
@@ -1364,7 +1178,13 @@ mod tests {
                 );
                 crate::trails::Way {
                     id: i as i64,
-                    kind: crate::trails::WayKind::Path,
+                    // A realistic mix: the detail control filters by class, and a
+                    // network of nothing but paths would hide that entirely.
+                    kind: match i % 3 {
+                        0 => crate::trails::WayKind::Path,
+                        1 => crate::trails::WayKind::Track,
+                        _ => crate::trails::WayKind::Road,
+                    },
                     name: None,
                     nodes: Vec::new(),
                     points,
@@ -1373,65 +1193,6 @@ mod tests {
                 }
             })
             .collect()
-    }
-
-    /// Trail source that records what is asked for and never answers — the
-    /// requests stay on the wire forever, like a hung Overpass instance.
-    #[derive(Default)]
-    struct RecordingTrails {
-        zones: std::cell::RefCell<Vec<ZoneKey>>,
-    }
-
-    impl crate::trails::TrailSource for RecordingTrails {
-        fn request(
-            &self,
-            zone: ZoneKey,
-            _attempt: usize,
-            _done: crate::trails::TrailCallback,
-        ) {
-            self.zones.borrow_mut().push(zone);
-        }
-        fn endpoint_count(&self) -> usize {
-            1
-        }
-    }
-
-    /// Trail source that answers on the spot with one way crossing the zone.
-    #[derive(Default)]
-    struct AnsweringTrails {
-        zones: std::cell::RefCell<Vec<ZoneKey>>,
-    }
-
-    impl crate::trails::TrailSource for AnsweringTrails {
-        fn request(&self, zone: ZoneKey, _attempt: usize, done: crate::trails::TrailCallback) {
-            self.zones.borrow_mut().push(zone);
-            let (s, w, n, e) = zone.bbox();
-            // Ids unique per zone, otherwise insertion would dedupe them away.
-            let id = (zone.lat as i64) * 100_000 + zone.lon as i64;
-            done(Ok(format!(
-                r#"{{"elements":[{{"type":"way","id":{id},"nodes":[{a},{b}],
-                   "tags":{{"highway":"path"}},
-                   "geometry":[{{"lat":{s},"lon":{w}}},{{"lat":{n},"lon":{e}}}]}}]}}"#,
-                a = id * 10,
-                b = id * 10 + 1,
-            )));
-        }
-        fn endpoint_count(&self) -> usize {
-            1
-        }
-    }
-
-    /// Swaps in a trail source that never touches the network.
-    fn silent_trails(app: &mut TrackFinderApp) -> Rc<RecordingTrails> {
-        let src = Rc::new(RecordingTrails::default());
-        app.trails = TrailStore::new(Rc::clone(&src) as Rc<dyn crate::trails::TrailSource>);
-        src
-    }
-
-    /// Distance from a zone's centre to a point, in metres.
-    fn zone_center_distance_m(zone: ZoneKey, to: LatLon) -> f64 {
-        let (s, w, n, e) = zone.bbox();
-        crate::geo::haversine_m(LatLon::new((s + n) / 2.0, (w + e) / 2.0), to)
     }
 
     /// Tile source that answers instantly, offline.
@@ -1481,7 +1242,9 @@ mod tests {
     fn offline_app() -> TrackFinderApp {
         let mut app = TrackFinderApp::with_source(Rc::new(StubTiles::default()));
         app.snap_to_trail = false;
-        app.auto_load_trails = false;
+        // No manifest is ever fetched here, so no tile request goes out: the
+        // benchmark measures rendering, not loading.
+        app.archive = TrailArchive::new("offline/");
         // Measured where the work actually happens: at the opening zoom over the
         // whole range no trail is drawn, and the numbers would mean nothing.
         app.fit_alps = false;
@@ -1579,7 +1342,7 @@ mod tests {
         println!("pan  · bare map         : median {med:.2} · p95 {p95:.2} · worst {worst:.2} ms");
 
         for way in fake_network(1500) {
-            app.trails.net.insert(way);
+            app.net.insert(way);
         }
         let (med, p95, worst) = bench_pan(&mut app, 200);
         println!("pan  · + 1500 trails    : median {med:.2} · p95 {p95:.2} · worst {worst:.2} ms");
@@ -1594,124 +1357,31 @@ mod tests {
         let (med, p95, worst) = bench_pan(&mut app, 200);
         println!("pan  · + 40-point track : median {med:.2} · p95 {p95:.2} · worst {worst:.2} ms");
 
+        // What the detail control is worth, on the same network and the same
+        // gesture. If the numbers do not move, the slider is decoration.
+        for level in [Detail::Sparse, Detail::Normal, Detail::Full] {
+            let mut app = offline_app();
+            for way in fake_network(1500) {
+                app.net.insert(way);
+            }
+            app.detail = level;
+            let (med, p95, worst) = bench_pan(&mut app, 200);
+            println!(
+                "pan  · detail {:<10}: median {med:.2} · p95 {p95:.2} · worst {worst:.2} ms",
+                level.label()
+            );
+        }
+
         // The gesture the whole tile-level machinery exists for.
         let mut app = offline_app();
         let (med, p95, worst) = bench_zoom(&mut app, 200);
         println!("zoom · bare map         : median {med:.2} · p95 {p95:.2} · worst {worst:.2} ms");
 
         for way in fake_network(1500) {
-            app.trails.net.insert(way);
+            app.net.insert(way);
         }
         let (med, p95, worst) = bench_zoom(&mut app, 200);
         println!("zoom · + 1500 trails    : median {med:.2} · p95 {p95:.2} · worst {worst:.2} ms");
-    }
-
-    #[test]
-    #[ignore = "network"]
-    fn a_click_on_a_trail_snaps() {
-        let ctx = egui::Context::default();
-        let mut app = TrackFinderApp::new();
-
-        // Place du Triangle de l'Amitie, Chamonix: dense pedestrian area.
-        let point = LatLon::new(45.9237, 6.8694);
-        skip_if_offline!(click(&mut app, point, &ctx));
-
-        let status = app.status.clone();
-        assert_eq!(app.track.waypoints.len(), 1, "status: {status:?}");
-        let wp = app.track.waypoints[0].clone();
-        let click = point;
-        let snap = wp.snap.expect("must be snapped");
-        assert!(snap.dist_m <= SNAP_RADIUS_M);
-        assert!(crate::geo::haversine_m(wp.pos, click) <= SNAP_RADIUS_M);
-    }
-
-    /// Spins the loop until the graph is built and its climbs read from the DEM
-    /// (both arrive asynchronously).
-    #[must_use]
-    fn settle(app: &mut TrackFinderApp, ctx: &egui::Context) -> bool {
-        for _ in 0..PATIENCE {
-            app.trails.pump(ctx);
-            app.dem.begin_frame(ctx);
-            app.update_graph(ctx);
-            if !app.graph.is_empty()
-                && app.graph_elevated
-                && app.trails.stats().1 == 0
-                && app.iso.is_some()
-            {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        false
-    }
-
-    #[test]
-    #[ignore = "network"]
-    fn isochrone_then_a_leg_on_real_ground() {
-        let ctx = egui::Context::default();
-        let mut app = TrackFinderApp::new();
-        app.budget_h = 1.0;
-
-        // Start of the Flegere trail, above Les Praz de Chamonix.
-        let start = LatLon::new(45.9328, 6.8846);
-        skip_if_offline!(click(&mut app, start, &ctx));
-        assert_eq!(app.track.waypoints.len(), 1, "{:?}", app.status);
-
-        // Then the basin around it: two large zones cover a 1 h budget.
-        app.trails.ensure_area(start, 2500.0, 2, &ctx);
-        app.graph_dirty = true;
-        skip_if_offline!(settle(&mut app, &ctx));
-
-        let iso = app.iso.as_ref().unwrap();
-        assert!(
-            iso.reach.reached_count() > 20,
-            "isochrone too small: {} nodes",
-            iso.reach.reached_count()
-        );
-        assert!(!iso.edges.is_empty());
-
-        // A target at mid-budget: neither on the spot nor at the edge.
-        let budget = iso.budget_ms;
-        let target = (0..app.graph.node_count() as u32)
-            .filter_map(|n| iso.reach.cost(n).map(|c| (c, n)))
-            .filter(|(c, _)| *c > budget / 3 && *c < budget * 3 / 4)
-            .max_by_key(|(c, _)| *c)
-            .map(|(_, n)| app.graph.nodes[n as usize])
-            .expect("a node at mid-budget");
-
-        skip_if_offline!(click(&mut app, target, &ctx));
-        assert_eq!(app.track.waypoints.len(), 2, "{:?}", app.status);
-
-        let leg = app.track.waypoints[1].clone();
-        let via = leg.via.expect("the leg must be routed through the graph");
-        assert!(via.len() > 4, "geometry too short: {}", via.len());
-
-        // Going by the trails is necessarily longer than the straight line.
-        let direct = crate::geo::haversine_m(app.track.waypoints[0].pos, leg.pos);
-        let walked = crate::trails::path_length_m(&via);
-        assert!(walked >= direct * 0.99, "walked {walked} < direct {direct}");
-        assert!(walked > 100.0);
-
-        app.track
-            .refresh(&app.trails.net, &mut app.dem, &app.walk, &ctx);
-        assert!(app.track.stats().distance_m > 100.0);
-    }
-
-    #[test]
-    #[ignore = "network"]
-    fn a_click_off_trail_is_refused() {
-        let ctx = egui::Context::default();
-        let mut app = TrackFinderApp::new();
-
-        // Middle of the Bossons glacier: no mapped path at all.
-        skip_if_offline!(click(&mut app, LatLon::new(45.8770, 6.8480), &ctx));
-
-        let status = app.status.clone();
-        assert!(app.track.waypoints.is_empty(), "status: {status:?}");
-        assert!(
-            status.unwrap().contains("refused"),
-            "the user has to know why nothing happened"
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -1738,65 +1408,6 @@ mod tests {
         assert_eq!(chance_color(2.0), high);
     }
 
-    /// Automatic loading must stay quiet while the view is moving and below the
-    /// zoom threshold: those two guards are what keeps Overpass from being
-    /// hammered one zone per frame.
-    #[test]
-    fn auto_loading_waits_for_a_settled_close_view() {
-        let ctx = egui::Context::default();
-        let mut app = TrackFinderApp::new();
-        silent_trails(&mut app);
-        app.last_map_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
-
-        // Too far out: nothing is requested, and the panel says why.
-        app.view = MapView::centered_on(CHAMONIX, 9.0);
-        app.update_auto_trails(&ctx);
-        assert_eq!(app.trails.stats().1, 0, "no request should go out at z9");
-        assert!(app.auto_trails_hint().is_some());
-
-        // Close in but still moving: still nothing.
-        let rect = app.last_map_rect;
-        app.view = MapView::centered_on(CHAMONIX, 15.0);
-        app.view.zoom_at(0.3, rect.center(), rect);
-        app.update_auto_trails(&ctx);
-        assert_eq!(app.trails.stats().1, 0, "a moving view must not fetch");
-
-        // Switched off entirely: nothing either, and no hint to show.
-        app.view = MapView::centered_on(CHAMONIX, 15.0);
-        app.auto_load_trails = false;
-        app.update_auto_trails(&ctx);
-        assert_eq!(app.trails.stats().1, 0);
-        assert!(app.auto_trails_hint().is_none());
-    }
-
-    /// Once settled and close enough, one scan happens and the next frames add
-    /// nothing: the scan is keyed on the centre zone plus the zoom.
-    #[test]
-    fn auto_loading_scans_once_per_zone() {
-        let ctx = egui::Context::default();
-        let mut app = TrackFinderApp::new();
-        silent_trails(&mut app);
-        app.last_map_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
-        app.view = MapView::centered_on(CHAMONIX, 15.0);
-
-        app.update_auto_trails(&ctx);
-        let after_first = app.trails.stats().1;
-        assert!(after_first > 0, "a settled close view must load its trails");
-        assert!(
-            after_first <= MAX_VISIBLE_ZONES,
-            "{after_first} zones exceeds the cap"
-        );
-
-        for _ in 0..10 {
-            app.update_auto_trails(&ctx);
-        }
-        assert_eq!(
-            app.trails.stats().1,
-            after_first,
-            "staying still must not queue anything more"
-        );
-    }
-
     /// The app opens on the whole range, and quietly: the opening zoom sits
     /// below the auto-loading threshold, so merely loading the page must not
     /// send anything to Overpass.
@@ -1804,7 +1415,7 @@ mod tests {
     fn it_opens_on_the_whole_alps_without_fetching_trails() {
         let ctx = egui::Context::default();
         let mut app = TrackFinderApp::with_source(Rc::new(StubTiles::default()));
-        silent_trails(&mut app);
+        app.archive = TrailArchive::new("offline/");
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 900.0));
         app.last_map_rect = rect;
         assert!(app.fit_alps, "the first frame owes us a fit");
@@ -1821,152 +1432,67 @@ mod tests {
             assert!(rect.contains(p), "{place:?} is off screen at {p:?}");
         }
         assert!(
-            app.view.tile_zoom() < AUTO_TRAILS_MIN_ZOOM,
-            "opening zoom z{} would trigger Overpass",
+            app.view.tile_zoom() < TRAILS_MIN_ZOOM,
+            "opening zoom z{} would already draw and load trails",
             app.view.tile_zoom()
         );
-        app.update_auto_trails(&ctx);
-        assert_eq!(app.trails.stats().1, 0, "opening must not hit Overpass");
-    }
-
-    /// Once a point is placed, loading follows **the point**, not the viewport.
-    /// Panning away to read the map must not send Overpass off to the far side of
-    /// the range while the basin you depend on stays half loaded.
-    #[test]
-    fn auto_loading_follows_the_last_point_not_the_view() {
-        let ctx = egui::Context::default();
-        let mut app = TrackFinderApp::with_source(Rc::new(StubTiles::default()));
-        let src = silent_trails(&mut app);
-        app.fit_alps = false;
-        app.last_map_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 900.0));
-
-        app.track.push(Waypoint::free(CHAMONIX));
-        // The map is looking 200 km away, in the southern Alps.
-        let elsewhere = LatLon::new(44.10, 6.20);
-        app.view = MapView::centered_on(elsewhere, 15.0);
-
-        app.update_auto_trails(&ctx);
-
-        let zones = src.zones.borrow();
-        assert!(!zones.is_empty(), "the basin must start loading");
-        for zone in zones.iter() {
-            assert!(
-                zone_center_distance_m(*zone, CHAMONIX) < 25_000.0,
-                "{zone:?} is not around the anchor"
-            );
-            assert!(
-                zone_center_distance_m(*zone, elsewhere) > 100_000.0,
-                "{zone:?} follows the view instead of the point"
-            );
-        }
-        // And the zoom gate no longer applies: the anchor decides, not the view.
-        assert!(app.auto_trails_hint().is_none());
-    }
-
-    /// A trickle, not a flood: Overpass grants two slots, so at most `BASIN_STEP`
-    /// new zones go out per settled frame, and nothing more while they are still
-    /// in flight — the answer to "did that help?" does not exist yet.
-    #[test]
-    fn the_basin_grows_a_few_zones_at_a_time() {
-        let ctx = egui::Context::default();
-        let mut app = TrackFinderApp::with_source(Rc::new(StubTiles::default()));
-        let src = silent_trails(&mut app);
-        app.fit_alps = false;
-        app.last_map_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 900.0));
-        app.view = MapView::centered_on(CHAMONIX, 15.0);
-        app.track.push(Waypoint::free(CHAMONIX));
-
-        app.update_auto_trails(&ctx);
-        let after_first = app.trails.stats().1;
-        assert!(after_first > 0 && after_first <= BASIN_STEP, "{after_first}");
-
-        for _ in 0..20 {
-            app.update_auto_trails(&ctx);
-        }
+        app.load_trails(&ctx);
         assert_eq!(
-            app.trails.stats().1,
-            after_first,
-            "nothing more may go out while zones are in flight"
+            app.archive.stats().1,
+            0,
+            "opening the whole range must not fetch a single tile"
         );
-        assert!(src.zones.borrow().len() <= BASIN_STEP);
     }
 
-    /// The basin stops when more data would change nothing: zones landed, the
-    /// isochrone did not get any further, so there is nothing to grow toward.
+    /// Detail levels must nest: anything a sparser level draws, a denser one
+    /// draws too. A slider that hid a trail as you asked for *more* detail would
+    /// be worse than no slider.
     #[test]
-    fn the_basin_stops_when_the_isochrone_stops_growing() {
-        let ctx = egui::Context::default();
-        let mut app = TrackFinderApp::with_source(Rc::new(StubTiles::default()));
-        let src = Rc::new(AnsweringTrails::default());
-        app.trails = TrailStore::new(Rc::clone(&src) as Rc<dyn crate::trails::TrailSource>);
-        app.fit_alps = false;
-        app.last_map_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 900.0));
-        app.view = MapView::centered_on(CHAMONIX, 15.0);
-        app.track.push(Waypoint::free(CHAMONIX));
-
-        for _ in 0..30 {
-            app.update_auto_trails(&ctx);
-            app.trails.pump(&ctx);
+    fn detail_levels_nest() {
+        use crate::trails::WayKind::*;
+        let kinds = [Path, Track, Footway, Steps, Cycleway, Road];
+        let (sparse, normal, full) = (Detail::Sparse, Detail::Normal, Detail::Full);
+        for k in kinds {
+            if sparse.draws(k) {
+                assert!(normal.draws(k), "{k:?} vanishes between sparse and normal");
+            }
+            if normal.draws(k) {
+                assert!(full.draws(k), "{k:?} vanishes between normal and full");
+            }
         }
-        let basin = app.basin.as_ref().expect("a basin");
-        assert!(basin.complete, "the basin must converge, not grind on");
-        assert!(basin.asked <= MAX_BASIN_ZONES, "{}", basin.asked);
-        assert!(
-            src.zones.borrow().len() <= MAX_BASIN_ZONES,
-            "{} zones requested",
-            src.zones.borrow().len()
-        );
-        // And it says so, rather than leaving a spinner turning.
-        let (text, partial) = app.basin_status().expect("a readout");
-        assert!(text.contains("basin"), "{text}");
-        assert!(!partial, "a converged basin is not partial: {text}");
-        assert!(!text.contains("growing"), "{text}");
-        assert!(basin.loaded > 0, "zones landed but none counted: {text}");
+        assert!(full.draws(Road) && !normal.draws(Road), "roads separate the top two");
+        assert!(normal.draws(Track) && !sparse.draws(Track), "tracks separate the bottom two");
+        assert!(sparse.draws(Path), "a hiking path is drawn at every level");
     }
 
-    /// Moving the last point moves the basin with it — the previous anchor's
-    /// budget must not carry over.
+    /// More detail means a finer decimation threshold, never a coarser one.
     #[test]
-    fn a_new_point_restarts_the_basin() {
+    fn more_detail_keeps_more_geometry() {
+        assert!(Detail::Sparse.min_segment_px2() > Detail::Normal.min_segment_px2());
+        assert!(Detail::Normal.min_segment_px2() > Detail::Full.min_segment_px2());
+        // Even at full detail, points inside the same pixel are still dropped:
+        // drawing the same line twice helps nobody.
+        assert!(Detail::Full.min_segment_px2() > 1.0);
+    }
+
+    /// The detail control is a display concern only. It must never change what
+    /// is loaded — the walking time is computed from the full geometry, and a
+    /// slider that quietly shortened the route would be a correctness bug.
+    #[test]
+    fn detail_changes_nothing_that_is_loaded() {
         let ctx = egui::Context::default();
         let mut app = TrackFinderApp::with_source(Rc::new(StubTiles::default()));
-        silent_trails(&mut app);
+        app.archive = TrailArchive::new("offline/");
         app.fit_alps = false;
         app.last_map_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 900.0));
         app.view = MapView::centered_on(CHAMONIX, 15.0);
 
-        app.track.push(Waypoint::free(CHAMONIX));
-        app.update_auto_trails(&ctx);
-        assert_eq!(app.basin.as_ref().unwrap().anchor, CHAMONIX);
-
-        let next = LatLon::new(45.98, 6.95);
-        app.track.push(Waypoint::free(next));
-        app.update_auto_trails(&ctx);
-        let basin = app.basin.as_ref().unwrap();
-        assert_eq!(basin.anchor, next);
-        assert!(!basin.complete);
-    }
-
-    /// The ceiling holds: a huge budget must not sweep the whole range off a
-    /// public service.
-    #[test]
-    fn the_basin_never_exceeds_its_ceiling() {
-        let ctx = egui::Context::default();
-        let mut app = TrackFinderApp::with_source(Rc::new(StubTiles::default()));
-        let src = silent_trails(&mut app);
-        app.fit_alps = false;
-        app.budget_h = 10.0;
-        app.last_map_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 900.0));
-        app.view = MapView::centered_on(CHAMONIX, 15.0);
-        app.track.push(Waypoint::free(CHAMONIX));
-
-        app.update_auto_trails(&ctx);
-        app.basin.as_mut().unwrap().asked = MAX_BASIN_ZONES;
-        let before = src.zones.borrow().len();
-        for _ in 0..50 {
-            app.update_auto_trails(&ctx);
-        }
-        assert_eq!(src.zones.borrow().len(), before, "the ceiling must hold");
+        app.detail = Detail::Sparse;
+        app.load_trails(&ctx);
+        let sparse = app.archive.stats();
+        app.detail = Detail::Full;
+        app.load_trails(&ctx);
+        assert_eq!(app.archive.stats(), sparse, "detail must not drive loading");
     }
 
     /// The base map is a single choice, and an overlay is never a ground layer.

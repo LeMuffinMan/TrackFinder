@@ -399,29 +399,41 @@ mod tests {
     }
 }
 
-/// Headless integration: Overpass → snap → segment following → DEM → Naismith.
-/// `cargo test -- --ignored`.
+/// Headless integration against the deployed data: trail tile → snap → segment
+/// following → DEM → Naismith. `cargo test -- --ignored`.
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod integration {
     use super::*;
     use crate::dem::DemStore;
     use crate::tiles::HttpTileSource;
-    use crate::trails::{tests::fetch_zone_blocking, TrailNetwork, ZoneKey, SNAP_RADIUS_M};
+    use crate::trails::{TrailNetwork, SNAP_RADIUS_M};
     use std::rc::Rc;
 
     #[test]
     #[ignore = "network"]
     fn a_real_leg_at_chamonix() {
+        const BASE: &str = "https://lemuffinman.github.io/TrackFinder/trails/alps/";
         let ctx = egui::Context::default();
-        let zone = ZoneKey::of(LatLon::new(45.92, 6.87));
-        let mut net = TrailNetwork::default();
-        for way in fetch_zone_blocking(zone).unwrap() {
-            net.insert(way);
-        }
 
-        // Two points on one long OSM way: the track must follow its geometry,
-        // not the chord.
+        // One published tile, straight over the Chamonix valley.
+        let tile = trailfmt::tile_of(45.92, 6.87, trailfmt::TILE_ZOOM);
+        let url = format!("{BASE}{}", trailfmt::tile_path(trailfmt::TILE_ZOOM, tile));
+        let resp = ehttp::fetch_blocking(&ehttp::Request::get(&url))
+            .unwrap_or_else(|e| panic!("{url}: {e}"));
+        assert!(resp.ok, "{url}: HTTP {}", resp.status);
+
+        let mut net = TrailNetwork::default();
+        let mut synthetic = 0i64;
+        for aw in trailfmt::decode_tile(&resp.bytes).expect("tile") {
+            if let Some(way) = crate::trails::Way::from_archive(aw, &mut synthetic) {
+                net.insert(way);
+            }
+        }
+        assert!(net.len() > 200, "{} ways", net.len());
+
+        // Two points on one long way: the track must follow its geometry, not
+        // the chord.
         let way = net
             .ways()
             .iter()

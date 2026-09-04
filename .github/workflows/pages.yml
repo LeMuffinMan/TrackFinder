@@ -108,32 +108,33 @@ jobs:
           echo "$(find data/trails -name '*.tft' | wc -l) tiles"
           du -sh data/trails
 
-      # The site is served from /TrackFinder/: without --public-url the HTML
-      # would look for the .wasm at the domain root and show nothing.
-      - name: Build
-        run: trunk build --release --public-url "/${GITHUB_REPOSITORY#*/}/"
-
-      # After `trunk build`, which wipes dist. The manifest is assembled from the
-      # fragments each preprocessor run writes, so a bounding box is never
-      # repeated by hand and can never drift from what was actually built.
-      - name: Publish trail tiles
+      # Always, cache hit or not: the fragments are inside the cached region
+      # directories, so this is cheap and keeps the manifest in step with what is
+      # actually on disk.
+      - name: Assemble the region manifest
         run: |
           set -euo pipefail
-          mkdir -p dist/trails
-          # One directory per region, each holding its index and its tiles.
-          for region in data/trails/*/; do
-            cp -r "$region" dist/trails/
-          done
           {
             printf '{"regions":['
             # `cat | paste -sd,` and not `paste -sd, files...`: the latter
             # serialises each file onto its own line instead of joining across
             # them, which is valid JSON only as long as there is exactly one
             # region — it would break the day a second massif is added.
-            cat data/trails/*.json | paste -sd,
+            cat data/trails/*/region.json | paste -sd,
             printf ']}'
-          } > dist/trails/regions.json
-          cat dist/trails/regions.json
+          } > data/trails/regions.json
+          cat data/trails/regions.json
+
+      # The site is served from /TrackFinder/: without --public-url the HTML
+      # would look for the .wasm at the domain root and show nothing.
+      #
+      # `index.html` carries a `copy-dir` for `data/trails`, so this step is also
+      # what publishes the tiles — there is no separate copy to forget.
+      - name: Build
+        run: trunk build --release --public-url "/${GITHUB_REPOSITORY#*/}/"
+
+      - name: Check the published tree
+        run: |
           echo "$(find dist/trails -name '*.tft' | wc -l) tiles published"
           du -sh dist/trails
 

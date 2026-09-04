@@ -1,77 +1,18 @@
-//! OSM trails: Overpass request per zone, local cache, spatial index, snapping.
+//! The trail network: data model, spatial index, snapping, segment following.
 //!
-//! The network is **local and on demand** — never country-wide. The world is cut
-//! into `ZONE_DEG` zones, we only ask for the ones we need, and we never ask
-//! twice.
+//! Local and on demand — never country-wide. Where the ways come from is
+//! `archive`'s business; this module only knows how to hold them and answer
+//! questions about them.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 use crate::geo::LatLon;
-
-/// Two zone sizes, in degrees.
-///
-/// - level 0 (~2.2 km): the click. Trade-off measured over Chamonix — 0.03° ×
-///   0.04° weighs 1.15 MB of JSON, 199 KB on the wire after gzip. Any bigger and
-///   the response becomes painful in town; any smaller and we multiply requests.
-/// - level 1 (~11 km): the isochrone, which needs a whole basin at once.
-///   Covering 25 km with level 0 zones would take ~500 requests.
-///
-/// Both levels feed the **same** `TrailNetwork`: insertion is idempotent by way
-/// id, so the overlap costs nothing.
-pub const ZONE_LEVELS: [f64; 2] = [0.02, 0.10];
-
-/// Size of the click zone — the finer one.
-pub const ZONE_DEG: f64 = ZONE_LEVELS[0];
 
 /// Side of a spatial index cell, in degrees (~220 m).
 const INDEX_CELL_DEG: f64 = 0.002;
 
 /// Largest accepted distance between a click and the nearest trail.
 pub const SNAP_RADIUS_M: f64 = 60.0;
-
-const HIGHWAY_FILTER: &str =
-    "^(path|track|footway|bridleway|steps|cycleway|pedestrian|living_street|unclassified|residential|tertiary)$";
-
-// ---------------------------------------------------------------------------
-// Zones
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ZoneKey {
-    pub level: u8,
-    pub lat: i32,
-    pub lon: i32,
-}
-
-impl ZoneKey {
-    /// The fine zone, the one a click needs.
-    pub fn of(ll: LatLon) -> Self {
-        Self::of_level(ll, 0)
-    }
-
-    pub fn of_level(ll: LatLon, level: u8) -> Self {
-        let size = ZONE_LEVELS[level as usize];
-        Self {
-            level,
-            lat: (ll.lat / size).floor() as i32,
-            lon: (ll.lon / size).floor() as i32,
-        }
-    }
-
-    pub fn size(self) -> f64 {
-        ZONE_LEVELS[self.level as usize]
-    }
-
-    /// (south, west, north, east)
-    pub fn bbox(self) -> (f64, f64, f64, f64) {
-        let size = self.size();
-        let s = self.lat as f64 * size;
-        let w = self.lon as f64 * size;
-        (s, w, s + size, w + size)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Data
@@ -88,15 +29,16 @@ pub enum WayKind {
 }
 
 impl WayKind {
-    fn from_tag(tag: &str) -> Self {
-        match tag {
-            "path" | "bridleway" => WayKind::Path,
-            "track" => WayKind::Track,
-            "footway" | "pedestrian" => WayKind::Footway,
-            "steps" => WayKind::Steps,
-            "cycleway" => WayKind::Cycleway,
-            _ => WayKind::Road,
-        }
+    /// True for the ways one actually walks a mountain route on, as opposed to
+    /// the roads and streets that merely happen to be walkable.
+    pub fn is_hiking(self) -> bool {
+        matches!(self, WayKind::Path | WayKind::Footway | WayKind::Steps)
+    }
+
+    /// True for anything off-tarmac: hiking ways plus forestry tracks and
+    /// cycleways, which carry a route just as well.
+    pub fn is_offroad(self) -> bool {
+        self.is_hiking() || matches!(self, WayKind::Track | WayKind::Cycleway)
     }
 
     /// Wire code → class. Unknown codes fall back to `Road`: a future archive
@@ -237,8 +179,9 @@ impl TrailNetwork {
     }
 
     pub fn insert(&mut self, way: Way) {
-        // Overpass returns whole ways, not clipped to the bbox: two neighbouring
-        // zones therefore report the same border ways.
+        // A way is filed under the tile holding its first point, but it can
+        // reach into neighbours, so two adjacent tiles report the same border
+        // ways. Dropping the repeat here is what makes that free.
         if self.by_id.contains_key(&way.id) || way.points.len() < 2 {
             return;
         }
@@ -332,201 +275,6 @@ fn point_segment(p: LatLon, a: LatLon, b: LatLon, mx: f64, my: f64) -> (f64, f64
     (t, (px * px + py * py).sqrt())
 }
 
-// ---------------------------------------------------------------------------
-// Overpass source
-// ---------------------------------------------------------------------------
-
-pub type TrailCallback = Box<dyn FnOnce(Result<String, String>) + Send + 'static>;
-
-pub trait TrailSource {
-    /// `attempt` drives endpoint switching: Overpass is a public, quota-limited
-    /// service that regularly answers 504 "too busy" — or stops answering at all.
-    fn request(&self, zone: ZoneKey, attempt: usize, done: TrailCallback);
-    fn endpoint_count(&self) -> usize;
-
-    /// The endpoint currently preferred, for the debug panel. When loading drags,
-    /// this is the first thing worth looking at.
-    fn preferred_endpoint(&self) -> Option<String> {
-        None
-    }
-}
-
-pub struct OverpassSource {
-    /// **Planet-wide** instances that send `Access-Control-Allow-Origin: *`
-    /// (verified 2026-09-03 — the header only appears when the request carries
-    /// an `Origin`, so it is invisible to bare `curl`).
-    ///
-    /// ⚠️ `overpass.osm.ch` does have CORS but only serves a **Swiss** extract:
-    /// it answers `200` with `elements: []` everywhere else in France. A regional
-    /// mirror is invisible in the status code — it shows up in the data. Do not
-    /// add it here.
-    endpoints: Vec<String>,
-    /// Index of the endpoint that last answered with data.
-    ///
-    /// ⚠️ **This is what makes bulk loading bearable.** Without it every zone
-    /// restarts the failover at instance 0, so a dead primary is rediscovered
-    /// once per zone: measured 2026-09-04, `overpass-api.de` refusing connections
-    /// and `overpass.kumi.systems` hanging cost ~13 s of dead time *per zone*
-    /// before the third instance answered in 1.65 s. Twelve zones spent two and a
-    /// half minutes doing nothing at all.
-    ///
-    /// `Arc<AtomicUsize>` rather than `Cell`: the callback that records success
-    /// has to be `Send`.
-    preferred: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl Default for OverpassSource {
-    fn default() -> Self {
-        Self {
-            endpoints: vec![
-                "https://overpass-api.de/api/interpreter".to_owned(),
-                "https://overpass.kumi.systems/api/interpreter".to_owned(),
-                "https://maps.mail.ru/osm/tools/overpass/api/interpreter".to_owned(),
-            ],
-            preferred: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        }
-    }
-}
-
-impl OverpassSource {
-    /// Endpoint to use for this attempt, counted from the last one that worked.
-    ///
-    /// Attempt 0 is the preferred instance, then the others in order, wrapping —
-    /// so a full round still covers every endpoint exactly once.
-    fn endpoint_index(&self, attempt: usize) -> usize {
-        let base = self.preferred.load(std::sync::atomic::Ordering::Relaxed);
-        (base + attempt) % self.endpoints.len()
-    }
-
-    /// Records the instance that answered, so the next zone starts there.
-    ///
-    /// Free-standing over the shared counter rather than a `&self` method: the
-    /// callback that calls it has to be `Send` and cannot hold the source.
-    fn note_success(preferred: &std::sync::atomic::AtomicUsize, index: usize) {
-        preferred.store(index, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn query(zone: ZoneKey) -> String {
-        let (s, w, n, e) = zone.bbox();
-        format!(
-            "[out:json][timeout:60];\nway[\"highway\"~\"{HIGHWAY_FILTER}\"]({s:.4},{w:.4},{n:.4},{e:.4});\nout geom;"
-        )
-    }
-}
-
-impl TrailSource for OverpassSource {
-    fn request(&self, zone: ZoneKey, attempt: usize, done: TrailCallback) {
-        let index = self.endpoint_index(attempt);
-        let url = self.endpoints[index].clone();
-        let mut request = ehttp::Request::post(url, OverpassSource::query(zone).into_bytes());
-        request
-            .headers
-            .insert("Content-Type", "text/plain;charset=UTF-8");
-        let preferred = Arc::clone(&self.preferred);
-        ehttp::fetch(request, move |result| {
-            let body = match result {
-                Err(e) => Err(e),
-                Ok(resp) if !resp.ok => Err(format!("HTTP {} {}", resp.status, resp.status_text)),
-                Ok(resp) => resp
-                    .text()
-                    .map(|t| t.to_owned())
-                    .ok_or_else(|| "non-textual response".to_owned()),
-            };
-            // Only a body that actually looks like the JSON we asked for counts:
-            // Overpass serves its overload page as HTML with a 200, and sticking
-            // to an instance that only ever returns that would be worse than not
-            // remembering anything.
-            if body.as_deref().is_ok_and(|b| b.trim_start().starts_with('{')) {
-                Self::note_success(&preferred, index);
-            }
-            done(body);
-        });
-    }
-
-    fn endpoint_count(&self) -> usize {
-        self.endpoints.len()
-    }
-
-    fn preferred_endpoint(&self) -> Option<String> {
-        self.endpoints.get(self.endpoint_index(0)).cloned()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Response parsing
-// ---------------------------------------------------------------------------
-
-pub fn parse_overpass(body: &str) -> Result<Vec<Way>, String> {
-    let root: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| format!("Overpass JSON: {e}"))?;
-    // Overpass reports some errors as HTML with a 200 status code; we then land
-    // on the parse error above rather than on silence.
-    let elements = root
-        .get("elements")
-        .and_then(|e| e.as_array())
-        .ok_or_else(|| "no `elements` field".to_owned())?;
-
-    let mut ways = Vec::with_capacity(elements.len());
-    for el in elements {
-        if el.get("type").and_then(|t| t.as_str()) != Some("way") {
-            continue;
-        }
-        let Some(id) = el.get("id").and_then(|v| v.as_i64()) else {
-            continue;
-        };
-        let Some(geometry) = el.get("geometry").and_then(|g| g.as_array()) else {
-            continue;
-        };
-        let points: Vec<LatLon> = geometry
-            .iter()
-            .filter_map(|p| {
-                Some(LatLon::new(
-                    p.get("lat")?.as_f64()?,
-                    p.get("lon")?.as_f64()?,
-                ))
-            })
-            .collect();
-        if points.len() < 2 {
-            continue;
-        }
-        let nodes = el
-            .get("nodes")
-            .and_then(|n| n.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
-            .unwrap_or_default();
-        let tags = el.get("tags");
-        let tag = |k: &str| {
-            tags.and_then(|t| t.get(k))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_owned())
-        };
-        let bounds = points.iter().fold(
-            (f64::MAX, f64::MAX, f64::MIN, f64::MIN),
-            |b, p| (b.0.min(p.lat), b.1.min(p.lon), b.2.max(p.lat), b.3.max(p.lon)),
-        );
-        ways.push(Way {
-            id,
-            bounds,
-            kind: WayKind::from_tag(tag("highway").as_deref().unwrap_or("")),
-            name: tag("name"),
-            nodes,
-            points,
-            sac_scale: tag("sac_scale"),
-        });
-    }
-    Ok(ways)
-}
-
-/// Distance from a point to the nearest edge of a zone — zero when the point is
-/// inside it. Used to order zone requests: the one under the eye first.
-fn zone_distance_m(key: ZoneKey, from: LatLon) -> f64 {
-    let (s, w, n, e) = key.bbox();
-    crate::geo::haversine_m(
-        from,
-        LatLon::new(from.lat.clamp(s, n), from.lon.clamp(w, e)),
-    )
-}
-
 /// Length of a polyline, in metres.
 pub fn path_length_m(points: &[LatLon]) -> f64 {
     points
@@ -535,401 +283,141 @@ pub fn path_length_m(points: &[LatLon]) -> f64 {
         .sum()
 }
 
-// ---------------------------------------------------------------------------
-// Per-zone cache
-// ---------------------------------------------------------------------------
-
-/// (zone, attempt number, response body)
-type ZoneReply = (ZoneKey, usize, Result<String, String>);
-
-/// Concurrent requests to Overpass. `https://overpass-api.de/api/status`
-/// announces "Rate limit: 2": beyond that the extra ones queue server side and a
-/// small urgent zone ends up stuck behind a large basin.
-const MAX_IN_FLIGHT: usize = 2;
-
-/// Delay past which a request is considered lost and we switch endpoint.
-/// Neither `fetch` (browser) nor `ehttp` exposes a timeout: without this guard
-/// an instance that never answers holds a slot for the whole session.
-///
-/// Seen for real on 2026-09-03: `overpass-api.de` answers `200` over IPv4 and
-/// nothing at all over IPv6 (TLS connection reset) from the dev machine. The
-/// browser tries IPv6 first, so without this delay the app would sit on a dead
-/// instance.
-const REQUEST_TIMEOUT_S: f64 = 12.0;
-
-pub struct TrailStore {
-    pub net: TrailNetwork,
-    source: Rc<dyn TrailSource>,
-    inbox: Arc<Mutex<Vec<ZoneReply>>>,
-    loaded: HashSet<ZoneKey>,
-    /// Zones asked for but not yet sent.
-    queue: VecDeque<(ZoneKey, usize)>,
-    in_flight: usize,
-    /// In-flight zone → (attempt number, send instant).
-    pending: HashMap<ZoneKey, (usize, web_time::Instant)>,
-    failed: HashMap<ZoneKey, String>,
-    pub last_error: Option<String>,
-}
-
-impl TrailStore {
-    pub fn new(source: Rc<dyn TrailSource>) -> Self {
-        Self {
-            net: TrailNetwork::default(),
-            source,
-            inbox: Arc::new(Mutex::new(Vec::new())),
-            loaded: HashSet::new(),
-            queue: VecDeque::new(),
-            in_flight: 0,
-            pending: HashMap::new(),
-            failed: HashMap::new(),
-            last_error: None,
-        }
-    }
-
-    pub fn overpass() -> Self {
-        Self::new(Rc::new(OverpassSource::default()))
-    }
-
-    /// True when this point is covered by a zone already in memory, **at any
-    /// level**: a large isochrone zone covers the fine zones inside it.
-    pub fn zone_ready(&self, ll: LatLon) -> bool {
-        (0..ZONE_LEVELS.len() as u8).any(|l| self.loaded.contains(&ZoneKey::of_level(ll, l)))
-    }
-
-    pub fn zone_failed(&self, ll: LatLon) -> Option<&str> {
-        self.failed.get(&ZoneKey::of(ll)).map(|s| s.as_str())
-    }
-
-    /// Requests the zone containing this point if it is missing. Idempotent —
-    /// that is the whole cache: a loaded zone is never requested again.
-    pub fn ensure(&mut self, ll: LatLon, ctx: &egui::Context) {
-        if self.zone_ready(ll) {
-            return;
-        }
-        self.ensure_key(ZoneKey::of(ll), ctx);
-    }
-
-    /// True when this zone is loaded, in flight, queued or known to have failed:
-    /// nothing more will be sent for it right now.
-    fn zone_settled(&self, key: &ZoneKey) -> bool {
-        self.loaded.contains(key)
-            || self.pending.contains_key(key)
-            || self.queue.iter().any(|(k, _)| k == key)
-            || self.failed.contains_key(key)
-    }
-
-    fn ensure_key(&mut self, key: ZoneKey, ctx: &egui::Context) {
-        if self.zone_settled(&key) {
-            return;
-        }
-        self.spawn(key, 0, ctx);
-    }
-
-    /// Fine zones covering a lat/lon window, in the order they should be asked
-    /// for: nearest to `center` first, so a cap keeps the useful ones.
-    pub fn zones_covering(
-        &self,
-        south: f64,
-        west: f64,
-        north: f64,
-        east: f64,
-        center: LatLon,
-    ) -> Vec<ZoneKey> {
-        let size = ZONE_DEG;
-        let mut keys = Vec::new();
-        let mut lat = (south / size).floor() * size;
-        while lat <= north {
-            let mut lon = (west / size).floor() * size;
-            while lon <= east {
-                keys.push(ZoneKey::of(LatLon::new(
-                    lat + size / 2.0,
-                    lon + size / 2.0,
-                )));
-                lon += size;
-            }
-            lat += size;
-        }
-        // The zone actually holding the centre comes first, explicitly: a centre
-        // sitting exactly on a zone boundary is equidistant from both, and the
-        // one the user is looking at is the one worth requesting first.
-        let home = ZoneKey::of(center);
-        keys.sort_by_key(|k| (*k != home, zone_distance_m(*k, center) as i64));
-        keys
-    }
-
-    /// Requests these zones, capped. Returns how many were actually sent.
-    pub fn ensure_zones(
-        &mut self,
-        keys: &[ZoneKey],
-        max_zones: usize,
-        ctx: &egui::Context,
-    ) -> usize {
-        let mut asked = 0;
-        for key in keys.iter().take(max_zones) {
-            if !self.zone_settled(key) {
-                asked += 1;
-            }
-            self.ensure_key(*key, ctx);
-        }
-        asked
-    }
-
-    /// The large zones covering a disc, nearest to the centre first.
-    ///
-    /// Coarse level: covering 25 km with click-sized zones would be ~500
-    /// requests. A pure query — nothing is sent.
-    pub fn area_zones(&self, center: LatLon, radius_m: f64) -> Vec<ZoneKey> {
-        let level = (ZONE_LEVELS.len() - 1) as u8;
-        let size = ZONE_LEVELS[level as usize];
-        let dlat = radius_m / 111_132.0;
-        let dlon = radius_m / (111_320.0 * center.lat.to_radians().cos()).max(1.0);
-
-        let mut keys = Vec::new();
-        let mut lat = ((center.lat - dlat) / size).floor() * size;
-        while lat <= center.lat + dlat {
-            let mut lon = ((center.lon - dlon) / size).floor() * size;
-            while lon <= center.lon + dlon {
-                keys.push(ZoneKey::of_level(
-                    LatLon::new(lat + size / 2.0, lon + size / 2.0),
-                    level,
-                ));
-                lon += size;
-            }
-            lat += size;
-        }
-        // Nearest first, and the zone actually holding the centre ahead of the
-        // rest: whatever a cap cuts should be the far edge, never the middle.
-        let home = ZoneKey::of_level(center, level);
-        keys.sort_by_key(|k| (*k != home, zone_distance_m(*k, center) as i64));
-        keys
-    }
-
-    /// Requests at most `max_new` of these zones that are not already loaded,
-    /// in flight, queued or failed. Returns how many were actually sent.
-    ///
-    /// The cap is on **new** requests, not on the list: that is what lets a
-    /// caller grow an area a couple of zones at a time instead of dumping fifty
-    /// on a service that grants two slots.
-    pub fn ensure_some(
-        &mut self,
-        keys: &[ZoneKey],
-        max_new: usize,
-        ctx: &egui::Context,
-    ) -> usize {
-        let mut asked = 0;
-        for key in keys {
-            if asked >= max_new {
-                break;
-            }
-            if self.zone_settled(key) {
-                continue;
-            }
-            self.ensure_key(*key, ctx);
-            asked += 1;
-        }
-        asked
-    }
-
-    /// How many of these zones are already in memory.
-    pub fn zones_loaded(&self, keys: &[ZoneKey]) -> usize {
-        keys.iter().filter(|k| self.loaded.contains(k)).count()
-    }
-
-    /// Loads the large zones covering a disc — what the isochrone needs.
-    /// Returns the number of zones requested, capped: Overpass is a public
-    /// quota-limited service, and an 8 h isochrone already spans ~25 km.
-    ///
-    /// Retries the failed ones on the way: this is the explicit button, and the
-    /// user asking again means "try again".
-    pub fn ensure_area(
-        &mut self,
-        center: LatLon,
-        radius_m: f64,
-        max_zones: usize,
-        ctx: &egui::Context,
-    ) -> usize {
-        let keys: Vec<ZoneKey> = self
-            .area_zones(center, radius_m)
-            .into_iter()
-            .take(max_zones)
-            .collect();
-        for key in &keys {
-            self.failed.remove(key);
-        }
-        self.ensure_some(&keys, max_zones, ctx)
-    }
-
-    /// Retries the failed zones (the "retry" button).
-    pub fn retry_failed(&mut self, ctx: &egui::Context) {
-        let zones: Vec<ZoneKey> = self.failed.keys().copied().collect();
-        self.failed.clear();
-        self.last_error = None;
-        for key in zones {
-            self.spawn(key, 0, ctx);
-        }
-    }
-
-    fn spawn(&mut self, key: ZoneKey, attempt: usize, ctx: &egui::Context) {
-        // Small zones (the user's click) jump ahead of large isochrone basins:
-        // it is the interaction that waits, not the other way round.
-        if key.level == 0 {
-            self.queue.push_front((key, attempt));
-        } else {
-            self.queue.push_back((key, attempt));
-        }
-        self.dispatch(ctx);
-    }
-
-    fn dispatch(&mut self, ctx: &egui::Context) {
-        while self.in_flight < MAX_IN_FLIGHT {
-            let Some((key, attempt)) = self.queue.pop_front() else {
-                return;
-            };
-            self.send(key, attempt, ctx);
-        }
-    }
-
-    fn send(&mut self, key: ZoneKey, attempt: usize, ctx: &egui::Context) {
-        self.in_flight += 1;
-        self.pending.insert(key, (attempt, web_time::Instant::now()));
-        let inbox = Arc::clone(&self.inbox);
-        let ctx = ctx.clone();
-        self.source.request(
-            key,
-            attempt,
-            Box::new(move |body| {
-                inbox.lock().unwrap().push((key, attempt, body));
-                ctx.request_repaint();
-            }),
-        );
-    }
-
-    /// True when new zones entered the network.
-    pub fn pump(&mut self, ctx: &egui::Context) -> bool {
-        let arrived = {
-            let mut inbox = self.inbox.lock().unwrap();
-            std::mem::take(&mut *inbox)
-        };
-        let mut changed = false;
-        for (key, attempt, body) in arrived {
-            // Reply from an attempt already abandoned on timeout: its slot was
-            // given back, do not give it back twice.
-            if self.pending.get(&key).map(|(a, _)| *a) != Some(attempt) {
-                continue;
-            }
-            self.pending.remove(&key);
-            self.in_flight = self.in_flight.saturating_sub(1);
-            match body.and_then(|b| parse_overpass(&b)) {
-                Ok(ways) => {
-                    for way in ways {
-                        self.net.insert(way);
-                    }
-                    self.loaded.insert(key);
-                    changed = true;
-                }
-                Err(e) => {
-                    // 504 "too busy" is the common case: switch endpoint before
-                    // giving up.
-                    if attempt + 1 < self.source.endpoint_count() {
-                        log::warn!("Overpass {e} — trying another instance");
-                        self.spawn(key, attempt + 1, ctx);
-                    } else {
-                        log::warn!("Overpass gave up: {e}");
-                        self.last_error = Some(e.clone());
-                        self.failed.insert(key, e);
-                    }
-                }
-            }
-        }
-        self.expire(ctx);
-        self.dispatch(ctx);
-        changed
-    }
-
-    /// Abandons requests that grew too old and switches endpoint.
-    fn expire(&mut self, ctx: &egui::Context) {
-        let stale: Vec<(ZoneKey, usize)> = self
-            .pending
-            .iter()
-            .filter(|(_, (_, sent))| sent.elapsed().as_secs_f64() > REQUEST_TIMEOUT_S)
-            .map(|(k, (a, _))| (*k, *a))
-            .collect();
-        for (key, attempt) in stale {
-            self.pending.remove(&key);
-            self.in_flight = self.in_flight.saturating_sub(1);
-            let msg = format!("no answer within {REQUEST_TIMEOUT_S:.0} s");
-            if attempt + 1 < self.source.endpoint_count() {
-                log::warn!("Overpass {msg} — trying another instance");
-                self.spawn(key, attempt + 1, ctx);
-            } else {
-                self.last_error = Some(msg.clone());
-                self.failed.insert(key, msg);
-            }
-        }
-    }
-
-    /// The Overpass instance requests currently go to first.
-    pub fn preferred_endpoint(&self) -> Option<String> {
-        self.source.preferred_endpoint()
-    }
-
-    /// (loaded zones, in progress, failed, ways)
-    pub fn stats(&self) -> (usize, usize, usize, usize) {
-        (
-            self.loaded.len(),
-            self.pending.len() + self.queue.len(),
-            self.failed.len(),
-            self.net.len(),
-        )
-    }
-}
-
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use super::*;
 
-    /// Two L-shaped ways that touch, around (45.900, 6.870).
-    const SAMPLE: &str = r#"{"version":0.6,"elements":[
-      {"type":"way","id":1,"nodes":[10,11,12],"tags":{"highway":"path","name":"Test Trail","sac_scale":"hiking"},
-       "geometry":[{"lat":45.9000,"lon":6.8700},{"lat":45.9010,"lon":6.8700},{"lat":45.9010,"lon":6.8720}]},
-      {"type":"way","id":2,"nodes":[12,13],"tags":{"highway":"track"},
-       "geometry":[{"lat":45.9010,"lon":6.8720},{"lat":45.9030,"lon":6.8720}]},
-      {"type":"node","id":10,"lat":45.9,"lon":6.87},
-      {"type":"way","id":3,"tags":{"highway":"path"},"geometry":[{"lat":45.9,"lon":6.87}]}
-    ]}"#;
+    /// Builds a way through the archive conversion, so these tests exercise the
+    /// same path the application uses rather than a hand-made shortcut.
+    ///
+    /// ⚠️ `synthetic` is passed in, never restarted per way. An earlier version
+    /// of this helper reset it on every call, and the first point of one way
+    /// silently collided with the last point of another: `Graph::build` counts
+    /// identities to find junctions, so it welded two unrelated trail ends
+    /// together. That is the phantom junction, and it is exactly why
+    /// `TrailArchive` keeps one counter for the whole network.
+    fn way(
+        synthetic: &mut i64,
+        id: i64,
+        kind: u8,
+        pts: &[(f64, f64)],
+        shared: &[Option<i64>],
+    ) -> Way {
+        Way::from_archive(
+            trailfmt::ArchiveWay {
+                id,
+                kind,
+                sac: 0,
+                name: None,
+                points: pts.to_vec(),
+                shared: shared.to_vec(),
+            },
+            synthetic,
+        )
+        .expect("a valid way")
+    }
 
+    /// Two ways meeting at node 12: an L, then a spur running north from its end.
+    ///
+    /// ```text
+    ///        (13) 45.9030
+    ///         |
+    /// (11)---(12)   45.9010
+    ///  |
+    /// (10)          45.9000
+    /// ```
     fn network() -> TrailNetwork {
         let mut net = TrailNetwork::default();
-        for way in parse_overpass(SAMPLE).unwrap() {
-            net.insert(way);
-        }
+        let mut synthetic = 0i64;
+        net.insert(way(
+            &mut synthetic,
+            1,
+            trailfmt::kind::PATH,
+            &[(45.9000, 6.8700), (45.9010, 6.8700), (45.9010, 6.8720)],
+            &[None, None, Some(12)],
+        ));
+        net.insert(way(
+            &mut synthetic,
+            2,
+            trailfmt::kind::TRACK,
+            &[(45.9010, 6.8720), (45.9030, 6.8720)],
+            &[Some(12), None],
+        ));
         net
     }
 
-    #[test]
-    fn parsing_skips_nodes_and_degenerate_geometry() {
-        let ways = parse_overpass(SAMPLE).unwrap();
-        assert_eq!(ways.len(), 2, "the node and the one-point way are dropped");
-        assert_eq!(ways[0].kind, WayKind::Path);
-        assert_eq!(ways[0].name.as_deref(), Some("Test Trail"));
-        assert_eq!(ways[0].nodes, vec![10, 11, 12]);
-        assert_eq!(ways[1].kind, WayKind::Track);
-    }
-
-    #[test]
-    fn an_html_error_is_reported() {
-        assert!(parse_overpass("<html>too busy</html>").is_err());
-    }
-
+    /// A way arriving twice must not be stored twice. Neighbouring tiles both
+    /// carry the ways that straddle their border.
     #[test]
     fn insertion_is_idempotent() {
-        // Overpass returns whole ways: two neighbouring zones report the same
-        // border ways, and they must not be duplicated.
         let mut net = network();
-        for way in parse_overpass(SAMPLE).unwrap() {
-            net.insert(way);
-        }
         assert_eq!(net.len(), 2);
+        let mut synthetic = -50i64;
+        net.insert(way(
+            &mut synthetic,
+            1,
+            trailfmt::kind::PATH,
+            &[(45.9000, 6.8700), (45.9010, 6.8700)],
+            &[None, None],
+        ));
+        assert_eq!(net.len(), 2, "way 1 came back and must be ignored");
+    }
+
+    /// Degenerate geometry never enters the network.
+    #[test]
+    fn a_one_point_way_is_refused() {
+        let net = TrailNetwork::default();
+        let lone = trailfmt::ArchiveWay {
+            id: 9,
+            kind: trailfmt::kind::PATH,
+            sac: 0,
+            name: None,
+            points: vec![(45.9, 6.87)],
+            shared: vec![None],
+        };
+        let mut synthetic = 0;
+        assert!(Way::from_archive(lone, &mut synthetic).is_none());
+        assert_eq!(net.len(), 0);
+    }
+
+    /// The archive's class and difficulty codes must survive into the model, and
+    /// unshared points must each get their own identity.
+    #[test]
+    fn archive_conversion_keeps_identity_and_metadata() {
+        let mut synthetic = 0;
+        let w = Way::from_archive(
+            trailfmt::ArchiveWay {
+                id: 7,
+                kind: trailfmt::kind::STEPS,
+                sac: 4,
+                name: Some("Échelles".to_owned()),
+                points: vec![(45.9, 6.87), (45.91, 6.88), (45.92, 6.89)],
+                shared: vec![Some(100), None, Some(200)],
+            },
+            &mut synthetic,
+        )
+        .unwrap();
+
+        assert_eq!(w.kind, WayKind::Steps);
+        assert_eq!(w.sac_scale.as_deref(), Some("alpine_hiking"));
+        assert_eq!(w.name.as_deref(), Some("Échelles"));
+        assert_eq!(w.nodes[0], 100);
+        assert_eq!(w.nodes[2], 200);
+        assert!(
+            w.nodes[1] < 0,
+            "an unshared point must not borrow a real OSM id: {:?}",
+            w.nodes
+        );
+        // Bounds are derived, and used to cull at render time.
+        assert!((w.bounds.0 - 45.9).abs() < 1e-9 && (w.bounds.3 - 6.89).abs() < 1e-9);
+    }
+
+    /// An unknown class must still draw rather than vanish: a future archive
+    /// version may add classes an older application has never heard of.
+    #[test]
+    fn an_unknown_class_falls_back_rather_than_disappearing() {
+        assert_eq!(WayKind::from_code(200), WayKind::Road);
+        assert_eq!(WayKind::from_code(trailfmt::kind::PATH), WayKind::Path);
     }
 
     #[test]
@@ -941,7 +429,7 @@ pub mod tests {
         assert_eq!(snap.way_id, 1);
         assert_eq!(snap.seg, 0);
         assert!(snap.dist_m < 20.0, "dist = {}", snap.dist_m);
-        assert!((snap.pos.lon - 6.8700).abs() < 1e-6);
+        assert!((snap.pos.lon - 6.8700).abs() < 1e-5);
         assert!((snap.t - 0.5).abs() < 0.05, "t = {}", snap.t);
     }
 
@@ -957,12 +445,12 @@ pub mod tests {
         let net = network();
         let a = net.snap(LatLon::new(45.9002, 6.8700), SNAP_RADIUS_M).unwrap();
         let b = net.snap(LatLon::new(45.9010, 6.8715), SNAP_RADIUS_M).unwrap();
-        let forward = net.follow(&a, &b).expect("same OSM way");
+        let forward = net.follow(&a, &b).expect("same way");
         // Must go through the elbow (45.9010, 6.8700), not cut the corner.
         assert!(forward.len() >= 3, "{forward:?}");
         assert!(forward
             .iter()
-            .any(|p| (p.lat - 45.9010).abs() < 1e-9 && (p.lon - 6.8700).abs() < 1e-9));
+            .any(|p| (p.lat - 45.9010).abs() < 1e-5 && (p.lon - 6.8700).abs() < 1e-5));
         let backward = net.follow(&b, &a).unwrap();
         assert_eq!(backward.len(), forward.len());
         assert!((backward[0].lat - forward.last().unwrap().lat).abs() < 1e-9);
@@ -978,117 +466,29 @@ pub mod tests {
         assert!(net.follow(&a, &b).is_none());
     }
 
-    #[test]
-    fn a_zone_contains_its_own_point() {
-        let ll = LatLon::new(45.9234, 6.8712);
-        let (s, w, n, e) = ZoneKey::of(ll).bbox();
-        assert!(s <= ll.lat && ll.lat < n && w <= ll.lon && ll.lon < e);
-        assert!((n - s - ZONE_DEG).abs() < 1e-12);
-        // Two points in the same zone share the key: that is what stops the zone
-        // from being requested twice.
-        assert_eq!(ZoneKey::of(ll), ZoneKey::of(LatLon::new(45.9236, 6.8714)));
-    }
-
-    #[test]
-    fn the_overpass_query_is_well_formed() {
-        let q = OverpassSource::query(ZoneKey::of(LatLon::new(45.92, 6.87)));
-        assert!(q.contains("[out:json]"), "{q}");
-        assert!(q.contains("out geom;"), "{q}");
-        assert!(q.contains("(45.9200,6.8600,45.9400,6.8800)"), "{q}");
-    }
-
-    /// The zones covering a window must contain its corners, and come out
-    /// nearest-first so that a cap keeps what is under the eye.
-    #[test]
-    fn covering_zones_are_ordered_from_the_centre() {
-        let store = TrailStore::new(Rc::new(OverpassSource::default()));
-        let center = LatLon::new(45.92, 6.87);
-        let keys = store.zones_covering(45.90, 6.85, 45.94, 6.89, center);
-        assert!(keys.len() >= 4, "{} zones", keys.len());
-        assert_eq!(keys[0], ZoneKey::of(center), "the centre comes first");
-        assert!(keys.contains(&ZoneKey::of(LatLon::new(45.901, 6.851))));
-        assert!(keys.contains(&ZoneKey::of(LatLon::new(45.939, 6.889))));
-        // Nothing has been requested: this is a pure query.
-        assert_eq!(store.stats(), (0, 0, 0, 0));
-    }
-
-    /// A dead instance must be discovered once, not once per zone.
+    /// The shared node must become a junction, and **only** it.
     ///
-    /// This is the whole failover cost: measured 2026-09-04, walking two
-    /// unreachable instances cost ~13 s before the third answered in 1.65 s.
-    /// Paying that per zone turned a ten-second basin into two and a half
-    /// minutes of waiting.
+    /// ⚠️ This is the phantom-junction guard. It fails loudly if unshared points
+    /// ever end up sharing an identity — the failure mode that produces an
+    /// isochrone teleporting between unrelated trails, with no error anywhere.
     #[test]
-    fn the_working_instance_is_remembered() {
-        let src = OverpassSource::default();
-        let n = src.endpoint_count();
-        assert!(n >= 3, "the test needs a few instances");
+    fn the_shared_node_is_the_only_junction() {
+        let net = network();
+        let ids: Vec<i64> = net.ways().iter().flat_map(|w| w.nodes.clone()).collect();
+        let distinct: std::collections::HashSet<i64> = ids.iter().copied().collect();
+        assert_eq!(ids.len(), 5, "three points plus two");
+        assert_eq!(distinct.len(), 4, "exactly one identity is shared: {ids:?}");
 
-        // Cold: attempts walk the list from the top.
-        assert_eq!(src.endpoint_index(0), 0);
-        assert_eq!(src.endpoint_index(1), 1);
-        assert_eq!(src.endpoint_index(2), 2);
-
-        // The third one answered. Every later zone starts there.
-        OverpassSource::note_success(&src.preferred, 2);
-        assert_eq!(src.endpoint_index(0), 2, "the next zone must start there");
-        assert_eq!(
-            src.preferred_endpoint().unwrap(),
-            src.endpoints[2],
-            "and the panel must say so"
-        );
-
-        // A full round still covers every instance exactly once, wrapping.
-        let visited: std::collections::HashSet<usize> =
-            (0..n).map(|a| src.endpoint_index(a)).collect();
-        assert_eq!(visited.len(), n, "a round must not skip or repeat: {visited:?}");
+        let graph = crate::graph::Graph::build(&net);
+        assert_eq!(graph.edges.len(), 2);
+        assert_eq!(graph.node_count(), 3, "two ends plus one junction");
     }
 
-    /// Fetches a zone synchronously, switching instance as needed.
-    /// Overpass regularly answers 504 "too busy".
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn fetch_zone_blocking(zone: ZoneKey) -> Result<Vec<Way>, String> {
-        let src = OverpassSource::default();
-        let mut last_err = String::new();
-        src.endpoints
-            .iter()
-            .find_map(|url| {
-                let mut request =
-                    ehttp::Request::post(url.clone(), OverpassSource::query(zone).into_bytes());
-                request
-                    .headers
-                    .insert("Content-Type", "text/plain;charset=UTF-8");
-                match ehttp::fetch_blocking(&request) {
-                    Ok(resp) if resp.ok => parse_overpass(resp.text().unwrap_or_default()).ok(),
-                    Ok(resp) => {
-                        last_err = format!("{url} → HTTP {}", resp.status);
-                        None
-                    }
-                    Err(e) => {
-                        last_err = format!("{url} → {e}");
-                        None
-                    }
-                }
-            })
-            .ok_or_else(|| format!("no Overpass instance answered: {last_err}"))
-    }
-
-    /// End to end against Overpass: `cargo test -- --ignored`.
     #[test]
-    #[ignore = "network"]
-    #[cfg(not(target_arch = "wasm32"))]
-    fn real_zone_over_chamonix() {
-        let zone = ZoneKey::of(LatLon::new(45.92, 6.87));
-        let ways = fetch_zone_blocking(zone).unwrap();
-        assert!(ways.len() > 50, "{} ways", ways.len());
-
-        let mut net = TrailNetwork::default();
-        for way in ways {
-            net.insert(way);
-        }
-        // Chamonix station sits a few metres from a pedestrian way.
-        let snap = net.snap(LatLon::new(45.9237, 6.8703), SNAP_RADIUS_M);
-        assert!(snap.is_some(), "no trail near the centre of Chamonix");
+    fn polyline_length_is_measured_on_the_ground() {
+        // ~1.11 km north-south.
+        let d = path_length_m(&[LatLon::new(45.0, 6.0), LatLon::new(45.01, 6.0)]);
+        assert!((d - 1112.0).abs() < 5.0, "{d}");
+        assert_eq!(path_length_m(&[LatLon::new(45.0, 6.0)]), 0.0);
     }
 }
-
