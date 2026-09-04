@@ -56,7 +56,7 @@ jobs:
       - name: Tests
         run: |
           cargo test --locked
-          cargo test --locked --manifest-path trailfmt/Cargo.toml
+          cargo test --locked -p trailfmt
 
       # Informative, never blocking: clippy follows the runner's stable release
       # and gains lints with every version. A new lint must not stop a
@@ -65,15 +65,23 @@ jobs:
         continue-on-error: true
         run: cargo clippy --locked --target wasm32-unknown-unknown --all-targets -- -D warnings
 
+      # A cache key may not contain commas, and the bounding box is full of them.
+      # Derived here rather than kept as a second, dash-separated copy of the
+      # box: two hand-maintained forms of the same value drift.
+      - name: Derive the data cache key
+        run: echo "DATA_KEY=${DATA_EPOCH}-${ALPS_BBOX//,/_}" >> "$GITHUB_ENV"
+
       # The archives are generated, never committed: a regenerated 30 MB blob in
-      # git history would be there for good. The cache key covers the
-      # preprocessor's own sources, so changing the format regenerates the data.
+      # git history would be there for good. The key covers the preprocessor's
+      # own sources, so changing the format regenerates the data. No
+      # `restore-keys`: a partial match would serve data built from a different
+      # box or a different format, which is worse than rebuilding.
       - name: Trail archive cache
         id: trails-cache
         uses: actions/cache@v4
         with:
           path: data/trails
-          key: trails-${{ env.DATA_EPOCH }}-${{ env.ALPS_BBOX }}-${{ hashFiles('trailprep/src/**', 'trailfmt/src/**') }}
+          key: trails-${{ env.DATA_KEY }}-${{ hashFiles('trailprep/src/**', 'trailfmt/src/**') }}
 
       # ~850 MB of extracts in, ~2 GB of RAM, a few minutes of CPU. Measured on
       # 2026-09-04: Rhône-Alpes alone peaked at 1.08 GB and took 219 s.
