@@ -3,14 +3,21 @@ name = "trackfinder"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+members = ["trailfmt", "trailprep"]
+# `cargo build` and `cargo test` at the root stay on the application. The
+# preprocessor is a build-time tool, driven explicitly by CI.
+default-members = ["."]
+
 [dependencies]
+trailfmt = { path = "trailfmt" }
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
 egui = "0.36"
 ehttp = "0.7"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 miniz_oxide = "0.9"
 serde_json = "1"
-# Instant qui fonctionne aussi en WASM (déjà utilisé par egui).
+# Instant that also works under WASM (already used by egui).
 web-time = "1"
 log = "0.4"
 
@@ -21,9 +28,16 @@ console_error_panic_hook = "0.1"
 console_log = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# Backends de fenêtrage : nécessaires seulement pour lancer en natif (dev/tests).
+# Windowing backends: only needed to run natively (dev and tests).
 eframe = { version = "0.36", features = ["x11", "wayland"] }
 env_logger = "0.11"
 
 [profile.release]
-opt-level = 2
+# Zooming decodes and uploads a whole grid of PNG tiles; opt-level 2 left that
+# visibly slow in the browser.
+#
+# `codegen-units = 1` was tried and dropped: a few percent of runtime for a much
+# longer release build, and `trunk serve --release` is the everyday dev loop here.
+# `panic` stays at unwind so `cargo test --release` (the benchmark) still runs.
+opt-level = 3
+lto = "thin"

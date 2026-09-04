@@ -1,9 +1,9 @@
-//! Conversions géographiques.
+//! Geographic conversions.
 //!
-//! ⚠️ Les deux pyramides de tuiles sont volontairement implémentées séparément
-//! (`pm` = Web Mercator pour les fonds, `wgs84g` = WGS84 géographique pour le MNT).
-//! Ne PAS les factoriser en une fonction paramétrée : altitudes décalées de
-//! plusieurs kilomètres sans erreur visible à la clé.
+//! ⚠️ The two tile pyramids are deliberately implemented separately
+//! (`pm` = Web Mercator for base maps, `wgs84g` = geographic WGS84 for the DEM).
+//! Do NOT merge them into one parameterised function: the payoff is elevations
+//! off by several kilometres with no visible error.
 
 use std::f64::consts::PI;
 
@@ -22,7 +22,7 @@ impl LatLon {
     }
 }
 
-/// Distance orthodromique en mètres (haversine).
+/// Great-circle distance in metres (haversine).
 pub fn haversine_m(a: LatLon, b: LatLon) -> f64 {
     let phi1 = a.lat.to_radians();
     let phi2 = b.lat.to_radians();
@@ -32,20 +32,21 @@ pub fn haversine_m(a: LatLon, b: LatLon) -> f64 {
     2.0 * EARTH_RADIUS_M * h.sqrt().asin()
 }
 
-/// Interpolation linéaire entre deux points (suffisante aux distances d'une étape).
+/// Linear interpolation between two points (accurate enough over one leg).
 pub fn lerp_latlon(a: LatLon, b: LatLon, t: f64) -> LatLon {
     LatLon::new(a.lat + (b.lat - a.lat) * t, a.lon + (b.lon - a.lon) * t)
 }
 
 // ---------------------------------------------------------------------------
-// Web Mercator — TILEMATRIXSET=PM — fonds de carte
+// Web Mercator — TILEMATRIXSET=PM — base map layers
 // ---------------------------------------------------------------------------
 pub mod pm {
     use super::{LatLon, PI};
 
     pub const MAX_LAT: f64 = 85.051_128_779_806_59;
 
-    /// Coordonnées monde normalisées : (0,0) = coin nord-ouest, (1,1) = sud-est.
+    /// Normalised world coordinates: (0,0) is the north-west corner, (1,1) the
+    /// south-east one.
     pub fn latlon_to_world(ll: LatLon) -> (f64, f64) {
         let lat = ll.lat.clamp(-MAX_LAT, MAX_LAT);
         let x = (ll.lon + 180.0) / 360.0;
@@ -61,8 +62,8 @@ pub mod pm {
         LatLon::new(lat, lon)
     }
 
-    /// Indices de tuile (col, row) pour un zoom entier.
-    #[allow(dead_code)] // le rendu travaille en coordonnées monde ; référence + test
+    /// Tile indices (col, row) at an integer zoom.
+    #[allow(dead_code)] // rendering works in world coordinates; reference + test
     pub fn tile_of(ll: LatLon, z: u8) -> (u32, u32) {
         let n = (1u64 << z) as f64;
         let (x, y) = latlon_to_world(ll);
@@ -73,19 +74,19 @@ pub mod pm {
 }
 
 // ---------------------------------------------------------------------------
-// WGS84 géographique — TILEMATRIXSET=WGS84G — MNT
-// Tuiles 256 px, étendue de 180° au zoom 0 (2 tuiles en largeur, 1 en hauteur).
+// Geographic WGS84 — TILEMATRIXSET=WGS84G — DEM
+// 256 px tiles, 180° span at zoom 0 (two tiles wide, one tall).
 // ---------------------------------------------------------------------------
 pub mod wgs84g {
     use super::LatLon;
 
-    /// Étendue d'une tuile, en degrés, au zoom `z`.
+    /// Span of one tile, in degrees, at zoom `z`.
     pub fn span_deg(z: u8) -> f64 {
         180.0 / (1u64 << z) as f64
     }
 
-    /// Indices de tuile (col, row).
-    #[allow(dead_code)] // `pixel_of` couvre les besoins actuels ; référence + test
+    /// Tile indices (col, row).
+    #[allow(dead_code)] // `pixel_of` covers current needs; reference + test
     pub fn tile_of(ll: LatLon, z: u8) -> (u32, u32) {
         let span = span_deg(z);
         let col = ((ll.lon + 180.0) / span).floor().max(0.0) as u32;
@@ -93,9 +94,9 @@ pub mod wgs84g {
         (col, row)
     }
 
-    /// Position en pixels flottants à l'intérieur de la tuile, dans [0, 256[.
-    /// `(col, row, px, py)` — px vers l'est, py vers le sud.
-    #[allow(dead_code)] // utilisé par DemStore via les coordonnées globales
+    /// Floating-point pixel position inside the tile, in [0, 256[.
+    /// `(col, row, px, py)` — px points east, py points south.
+    #[allow(dead_code)] // used by DemStore through global pyramid coordinates
     pub fn pixel_of(ll: LatLon, z: u8) -> (u32, u32, f64, f64) {
         let span = span_deg(z);
         let fx = (ll.lon + 180.0) / span;
@@ -107,10 +108,15 @@ pub mod wgs84g {
         (col, row, px, py)
     }
 
-    /// Taille d'un pixel MNT en mètres à cette latitude.
-    /// ⚠️ La grille est en degrés : à 45°N, 1° de longitude ≈ 78 km contre 111 km
-    /// pour la latitude. Indispensable avant tout calcul de pente / TPI (M3).
-    #[allow(dead_code)] // M3 : pente, exposition, TPI
+    /// Size of one DEM pixel, in metres, at this latitude.
+    ///
+    /// ⚠️ The grid is in degrees: at 45°N one degree of longitude is about
+    /// 78 km against 111 km for one degree of latitude.
+    ///
+    /// This is no longer a correction but a guard rail: `terrain` samples on a
+    /// constant metric step and uses this size only to check that the step
+    /// spans several pixels (see `terrain::step_spans_several_pixels`).
+    #[allow(dead_code)] // only called from the `terrain` tests
     pub fn pixel_size_m(lat: f64, z: u8) -> (f64, f64) {
         let deg = span_deg(z) / super::TILE_PX as f64;
         let m_per_deg_lat = 111_132.0;
@@ -124,12 +130,12 @@ mod tests {
     use super::*;
 
     const CHAMONIX: LatLon = LatLon::new(45.92, 6.87);
-    /// Tuiles réellement testées le 02/09/2026 (réponse 200 des deux services).
+    /// Tiles actually exercised on 2026-09-02 (both services answered 200).
     const PM_TILE: (u32, u32) = (8504, 5833);
     const WGS84G_TILE: (u32, u32) = (17010, 4012);
 
-    /// Le centre de la tuile PM de référence doit retomber sur cette même tuile,
-    /// et se situer sur Chamonix à moins de 3 km.
+    /// The centre of the reference PM tile must map back to that same tile, and
+    /// land within 3 km of Chamonix.
     #[test]
     fn pm_reference_tile() {
         let n = (1u64 << 14) as f64;
@@ -141,8 +147,8 @@ mod tests {
         assert!(haversine_m(center, CHAMONIX) < 3000.0, "centre = {center:?}");
     }
 
-    /// Idem pour la grille du MNT — c'est la formule validée sur la vallée de
-    /// Chamonix (altitudes 1043–1827 m sur cette tuile).
+    /// Same for the DEM grid — this is the formula validated over the Chamonix
+    /// valley (elevations 1043–1827 m on that tile).
     #[test]
     fn wgs84g_reference_tile() {
         let span = wgs84g::span_deg(14);
@@ -154,8 +160,8 @@ mod tests {
         assert!(haversine_m(center, CHAMONIX) < 3000.0, "centre = {center:?}");
     }
 
-    /// `pixel_of` et `tile_of` doivent être cohérents, et le pixel rester dans
-    /// la tuile.
+    /// `pixel_of` and `tile_of` must agree, and the pixel must stay inside the
+    /// tile.
     #[test]
     fn wgs84g_pixel_inside_tile() {
         let (col, row, px, py) = wgs84g::pixel_of(CHAMONIX, 14);
@@ -171,8 +177,8 @@ mod tests {
         assert!((back.lon - CHAMONIX.lon).abs() < 1e-9);
     }
 
-    /// À 45°N un degré de longitude vaut nettement moins qu'un degré de latitude :
-    /// c'est tout le piège des calculs de pente du M3.
+    /// At 45°N a degree of longitude is much shorter than a degree of latitude:
+    /// that is the whole trap behind the terrain calculations.
     #[test]
     fn dem_pixel_is_anisotropic() {
         let (mx, my) = wgs84g::pixel_size_m(45.92, 14);
@@ -182,7 +188,7 @@ mod tests {
 
     #[test]
     fn haversine_known_distance() {
-        // 1° de latitude ≈ 111.2 km
+        // 1° of latitude ≈ 111.2 km
         let d = haversine_m(LatLon::new(45.0, 6.0), LatLon::new(46.0, 6.0));
         assert!((d - 111_195.0).abs() < 500.0, "d = {d}");
     }

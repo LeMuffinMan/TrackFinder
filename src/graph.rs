@@ -1,9 +1,9 @@
-//! Graphe de sentiers local et isochrone.
+//! Local trail graph and isochrone.
 //!
-//! Construit à la demande depuis le réseau OSM déjà chargé — **jamais à
-//! l'échelle France**. Les nœuds sont les nœuds OSM partagés entre chemins (les
-//! jonctions) ; une arête porte tout un tronçon entre deux jonctions, ce qui
-//! divise la taille du graphe par ~10 par rapport à un nœud par point.
+//! Built on demand from the OSM network already loaded — **never country-wide**.
+//! Nodes are the OSM nodes shared between ways (the junctions); one edge carries
+//! a whole segment between two junctions, which divides the graph size by about
+//! ten compared with one node per shape point.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -14,24 +14,24 @@ use crate::geo::{haversine_m, LatLon};
 use crate::track::WalkSettings;
 use crate::trails::{Snap, TrailNetwork};
 
-/// Coût en millisecondes : un entier, donc ordonnable et sans surprise de
-/// comparaison flottante dans le tas binaire.
+/// Cost in milliseconds: an integer, so it orders cleanly with no floating
+/// point comparison surprises inside the binary heap.
 pub type CostMs = u64;
 
 pub struct Edge {
     pub a: u32,
     pub b: u32,
     pub way_id: i64,
-    /// Indices dans `way.points`, avec `from < to`.
+    /// Indices into `way.points`, with `from < to`.
     pub from: u32,
     pub to: u32,
     pub len_m: f64,
-    /// Dénivelé dans le sens `from → to`. `None` tant que le MNT n'est pas là.
+    /// Climb in the `from → to` direction. `None` until the DEM has arrived.
     pub climb: Option<(f32, f32)>,
 }
 
 impl Edge {
-    /// Temps de parcours dans le sens donné, en millisecondes.
+    /// Travel time in the given direction, in milliseconds.
     pub fn cost_ms(&self, forward: bool, w: &WalkSettings) -> CostMs {
         let (up, _down) = match self.climb {
             Some((up, down)) if forward => (up as f64, down as f64),
@@ -47,22 +47,22 @@ impl Edge {
 
 #[derive(Default)]
 pub struct Graph {
-    /// Position de chaque nœud, indexé par l'identifiant interne.
+    /// Position of each node, indexed by internal id.
     pub nodes: Vec<LatLon>,
-    /// Identifiant OSM → indice interne.
+    /// OSM id → internal index.
     osm_to_node: HashMap<i64, u32>,
     pub edges: Vec<Edge>,
-    /// nœud → arêtes incidentes.
+    /// node → incident edges.
     adj: Vec<Vec<u32>>,
-    /// chemin OSM → arêtes issues de ce chemin.
+    /// OSM way → edges derived from that way.
     by_way: HashMap<i64, Vec<u32>>,
 }
 
-/// Où tombe un point accroché, dans le graphe.
+/// Where a snapped point falls inside the graph.
 #[derive(Clone, Copy, Debug)]
 pub struct EdgePos {
     pub edge: u32,
-    /// Distance en mètres jusqu'au nœud `a` de l'arête, le long du tronçon.
+    /// Distance in metres to the edge's `a` node, along the segment.
     pub to_a_m: f64,
     pub to_b_m: f64,
 }
@@ -76,8 +76,8 @@ impl Graph {
         self.nodes.len()
     }
 
-    /// Construit le graphe : les nœuds sont les jonctions (nœud OSM porté par
-    /// plusieurs chemins) et les extrémités de chemin.
+    /// Builds the graph: nodes are junctions (an OSM node carried by several
+    /// ways) plus the way endpoints.
     pub fn build(net: &TrailNetwork) -> Self {
         let mut occurrences: HashMap<i64, u32> = HashMap::new();
         for way in net.ways() {
@@ -88,8 +88,8 @@ impl Graph {
 
         let mut g = Graph::default();
         for way in net.ways() {
-            // `out geom` aligne `nodes` et `geometry` ; sans cet alignement on ne
-            // sait pas quel point porte quel identifiant.
+            // `out geom` aligns `nodes` and `geometry`; without that alignment
+            // we cannot tell which point carries which id.
             if way.nodes.len() != way.points.len() {
                 continue;
             }
@@ -139,9 +139,9 @@ impl Graph {
         self.edges.push(edge);
     }
 
-    /// Remplit les dénivelés manquants depuis le MNT. Renvoie vrai quand tout est
-    /// renseigné — les tuiles arrivant de façon asynchrone, on rappelle à chaque
-    /// frame jusque-là.
+    /// Fills in the missing climbs from the DEM. Returns true once everything is
+    /// filled — tiles arrive asynchronously, so this is called every frame until
+    /// then.
     pub fn update_elevations(
         &mut self,
         net: &TrailNetwork,
@@ -160,8 +160,8 @@ impl Graph {
             let mut down = 0.0f32;
             let mut prev: Option<f32> = None;
             let mut missing = false;
-            // Un point sur deux au maximum : le MNT du graphe est à ~38 m/pixel,
-            // échantillonner plus fin ne dirait rien de plus.
+            // The graph DEM is ~38 m/pixel: sampling finer than the shape points
+            // would not say anything more.
             for i in edge.from..=edge.to {
                 let Some(alt) = dem.elevation_at(way.points[i as usize], GRAPH_DEM_ZOOM, ctx)
                 else {
@@ -187,7 +187,7 @@ impl Graph {
         complete
     }
 
-    /// Retrouve l'arête portant un point accroché.
+    /// Finds the edge carrying a snapped point.
     pub fn locate(&self, net: &TrailNetwork, snap: &Snap) -> Option<EdgePos> {
         let way = net.way_by_id(snap.way_id)?;
         let candidates = self.by_way.get(&snap.way_id)?;
@@ -201,7 +201,7 @@ impl Graph {
             .or(candidates.first())?;
         let e = &self.edges[edge_idx as usize];
 
-        // Distance le long du tronçon, de `from` jusqu'au point accroché.
+        // Distance along the segment, from `from` to the snapped point.
         let mut to_a_m = 0.0;
         for i in e.from..seg.min(e.to) {
             to_a_m += haversine_m(way.points[i as usize], way.points[i as usize + 1]);
@@ -219,8 +219,8 @@ impl Graph {
         })
     }
 
-    /// Deux sources pondérées : les deux extrémités de l'arête où l'on se trouve,
-    /// chacune avec le coût de la portion à parcourir pour l'atteindre.
+    /// Two weighted sources: both ends of the edge we stand on, each carrying the
+    /// cost of the partial stretch needed to reach it.
     pub fn sources_from(&self, pos: &EdgePos, w: &WalkSettings) -> Vec<(u32, CostMs)> {
         let e = &self.edges[pos.edge as usize];
         let full = e.cost_ms(true, w).max(1) as f64;
@@ -233,8 +233,8 @@ impl Graph {
         ]
     }
 
-    /// Dijkstra borné par le budget. C'est à la fois l'isochrone et l'arbre des
-    /// plus courts chemins qui servira à construire l'étape.
+    /// Dijkstra bounded by the budget. This is both the isochrone and the
+    /// shortest-path tree the leg is built from.
     pub fn explore(
         &self,
         sources: &[(u32, CostMs)],
@@ -272,7 +272,7 @@ impl Graph {
     }
 }
 
-/// Résultat d'une exploration : coût d'accès de chaque nœud et arbre des chemins.
+/// Result of an exploration: access cost of each node, plus the path tree.
 pub struct Reach {
     pub dist: Vec<CostMs>,
     prev: Vec<Option<(u32, u32)>>,
@@ -290,9 +290,9 @@ impl Reach {
         self.dist.iter().filter(|c| **c != CostMs::MAX).count()
     }
 
-    /// Arêtes dont les deux extrémités sont atteintes : ce sont elles qu'on
-    /// colore. On ne dessine pas de polygone de zone — on ne marche que sur les
-    /// sentiers, une tache pleine mentirait sur le terrain traversable.
+    /// Edges with both ends reached: those are the ones we colour. We draw no
+    /// area polygon — you only ever walk on trails, and a filled blob would lie
+    /// about which ground can be crossed.
     pub fn reachable_edges(&self, graph: &Graph) -> Vec<(u32, CostMs)> {
         graph
             .edges
@@ -306,7 +306,7 @@ impl Reach {
             .collect()
     }
 
-    /// Remonte l'arbre depuis un nœud jusqu'à une source.
+    /// Walks the tree back from a node to a source.
     fn edges_to(&self, node: u32) -> Option<Vec<(u32, u32)>> {
         let mut out = Vec::new();
         let mut cur = node;
@@ -314,7 +314,7 @@ impl Reach {
             out.push((parent, edge));
             cur = parent;
             if out.len() > 100_000 {
-                return None; // garde-fou : jamais vu, mais une boucle serait fatale
+                return None; // guard rail: never seen, but a cycle would be fatal
             }
         }
         out.reverse();
@@ -322,18 +322,18 @@ impl Reach {
     }
 }
 
-/// Étape calculée entre deux points accrochés.
+/// A leg computed between two snapped points.
 pub struct Route {
     pub points: Vec<LatLon>,
     pub cost_ms: CostMs,
 }
 
-/// Construit la géométrie d'un itinéraire entre deux points accrochés, en
-/// suivant l'arbre des plus courts chemins.
+/// Builds the geometry of a route between two snapped points, following the
+/// shortest-path tree.
 ///
-/// Les deux extrémités tombent au milieu d'une arête : il faut recoller la
-/// portion entre le point cliqué et le nœud du graphe, sinon le tracé « saute »
-/// à la jonction la plus proche.
+/// Both ends fall in the middle of an edge: the stretch between the clicked
+/// point and the graph node has to be stitched back on, otherwise the track
+/// "jumps" to the nearest junction.
 pub fn route(
     graph: &Graph,
     net: &TrailNetwork,
@@ -346,8 +346,8 @@ pub fn route(
     let (to_snap, to_pos) = to;
     let end_edge = &graph.edges[to_pos.edge as usize];
 
-    // Des deux extrémités de l'arête d'arrivée, on garde celle qui minimise
-    // « coût pour l'atteindre + portion restante à parcourir ».
+    // Of the two ends of the arrival edge, keep the one that minimises
+    // "cost to reach it + remaining stretch to walk".
     let partial_ms = |m: f64| (m / 1000.0 / w.flat_kmh.max(0.1) * 3_600_000.0) as CostMs;
     let (total_ms, end_node, end_toward_a) = [
         reach.cost(end_edge.a).map(|c| (c + partial_ms(to_pos.to_a_m), end_edge.a, true)),
@@ -360,7 +360,7 @@ pub fn route(
     let chain = reach.edges_to(end_node)?;
     let start_node = chain.first().map(|(p, _)| *p).unwrap_or(end_node);
 
-    // Départ : du point cliqué jusqu'au nœud d'où part l'arbre.
+    // Start: from the clicked point to the node the tree starts from.
     let start_edge = &graph.edges[from_pos.edge as usize];
     let start_toward_a = start_node == start_edge.a;
     let mut points = partial_geometry(net, start_edge, from_snap, start_toward_a)?;
@@ -371,7 +371,7 @@ pub fn route(
         points.extend(edge_geometry(net, edge, forward)?.skip(1));
     }
 
-    // Arrivée : du nœud jusqu'au point cliqué (géométrie inversée).
+    // Arrival: from the node to the clicked point (reversed geometry).
     let mut tail = partial_geometry(net, end_edge, to_snap, end_toward_a)?;
     tail.reverse();
     points.extend(tail.into_iter().skip(1));
@@ -383,8 +383,8 @@ pub fn route(
     })
 }
 
-/// Portion de chemin entre un point accroché et l'une des extrémités de son
-/// arête. Le premier point est toujours le point accroché.
+/// Stretch of way between a snapped point and one end of its edge. The first
+/// point is always the snapped one.
 fn partial_geometry(
     net: &TrailNetwork,
     edge: &Edge,
@@ -406,7 +406,7 @@ fn partial_geometry(
     Some(out)
 }
 
-/// Géométrie d'une arête, dans le sens demandé.
+/// Geometry of an edge, in the requested direction.
 pub fn edge_geometry<'a>(
     net: &'a TrailNetwork,
     edge: &Edge,
@@ -443,7 +443,7 @@ mod tests {
         }
     }
 
-    /// Une croix : un chemin est-ouest et un chemin nord-sud partageant le nœud 3.
+    /// A cross: one east-west way and one north-south way sharing node 3.
     ///
     /// ```text
     ///            (5) 45.012
@@ -473,30 +473,30 @@ mod tests {
     }
 
     #[test]
-    fn les_noeuds_du_graphe_sont_les_jonctions() {
+    fn graph_nodes_are_the_junctions() {
         let g = Graph::build(&cross());
-        // Nœuds retenus : 1, 3, 4 (extrémités + jonction) côté chemin 10, et 5, 6.
-        // Le nœud 2, simple point de forme, ne devient pas un nœud du graphe.
-        assert_eq!(g.node_count(), 5, "le point de forme ne doit pas être un nœud");
+        // Kept nodes: 1, 3, 4 (endpoints + junction) on way 10, plus 5 and 6.
+        // Node 2, a mere shape point, does not become a graph node.
+        assert_eq!(g.node_count(), 5, "a shape point must not become a node");
         assert_eq!(g.edges.len(), 4);
-        // Le tronçon 1→3 porte bien les deux segments.
+        // The 1→3 stretch carries both segments.
         let e = g.edges.iter().find(|e| e.way_id == 10 && e.from == 0).unwrap();
         assert_eq!(e.to, 2);
-        // deux segments de ~157 m
+        // two ~157 m segments
         assert!((e.len_m - 314.0).abs() < 5.0, "len = {}", e.len_m);
     }
 
     #[test]
-    fn chemin_mal_forme_ignore() {
-        // `nodes` et `geometry` désalignés : on ne sait pas quel point porte quel
-        // identifiant, donc on n'invente rien.
+    fn a_malformed_way_is_ignored() {
+        // `nodes` and `geometry` out of step: we cannot tell which point carries
+        // which id, so we invent nothing.
         let mut net = TrailNetwork::default();
         net.insert(way(1, &[1, 2], &[(45.0, 6.0), (45.0, 6.001), (45.0, 6.002)]));
         assert!(Graph::build(&net).is_empty());
     }
 
     #[test]
-    fn le_cout_depend_du_sens() {
+    fn cost_depends_on_direction() {
         let w = WalkSettings {
             pack_weight_kg: 0.0,
             ..Default::default()
@@ -510,15 +510,15 @@ mod tests {
             len_m: 5000.0,
             climb: Some((600.0, 0.0)),
         };
-        // 5 km plat = 1 h ; +600 m = 1 h de plus à la montée, rien à la descente.
+        // 5 km flat = 1 h; +600 m = one more hour uphill, nothing downhill.
         let up = edge.cost_ms(true, &w) as f64 / 3_600_000.0;
         let down = edge.cost_ms(false, &w) as f64 / 3_600_000.0;
-        assert!((up - 2.0).abs() < 1e-6, "montée {up}");
-        assert!((down - 1.0).abs() < 1e-6, "descente {down}");
+        assert!((up - 2.0).abs() < 1e-6, "uphill {up}");
+        assert!((down - 1.0).abs() < 1e-6, "downhill {down}");
     }
 
     #[test]
-    fn isochrone_bornee_par_le_budget() {
+    fn the_isochrone_is_bounded_by_the_budget() {
         let net = cross();
         let mut g = Graph::build(&net);
         for e in &mut g.edges {
@@ -529,22 +529,22 @@ mod tests {
             pack_weight_kg: 0.0,
             ..Default::default()
         };
-        // Depuis le nœud le plus à l'ouest (nœud OSM 1).
+        // From the westernmost node (OSM node 1).
         let start = g.osm_to_node[&1];
 
-        // 5 minutes à 5 km/h ≈ 416 m : on atteint la jonction (314 m), pas la
-        // suivante (314 + 157 m).
+        // 5 minutes at 5 km/h ≈ 416 m: we reach the junction (314 m), not the
+        // next one (314 + 157 m).
         let tight = g.explore(&[(start, 0)], 300_000, &w);
         assert_eq!(tight.reached_count(), 2);
 
-        // 10 minutes : tout le réseau.
+        // 10 minutes: the whole network.
         let wide = g.explore(&[(start, 0)], 600_000, &w);
         assert_eq!(wide.reached_count(), g.node_count());
         assert_eq!(wide.reachable_edges(&g).len(), 4);
     }
 
     #[test]
-    fn le_denivele_ralentit_lisochrone() {
+    fn climb_slows_the_isochrone_down() {
         let net = cross();
         let mut flat = Graph::build(&net);
         for e in &mut flat.edges {
@@ -560,12 +560,12 @@ mod tests {
         assert!(
             flat.explore(&[(start, 0)], budget, &w).reached_count()
                 > steep.explore(&[(start, 0)], budget, &w).reached_count(),
-            "à budget égal, on va moins loin en montée"
+            "for the same budget, uphill gets you less far"
         );
     }
 
     #[test]
-    fn litineraire_suit_les_sentiers() {
+    fn the_route_follows_the_trails() {
         let net = cross();
         let mut g = Graph::build(&net);
         for e in &mut g.edges {
@@ -573,8 +573,8 @@ mod tests {
         }
         let w = WalkSettings::default();
 
-        // De l'extrémité ouest vers l'extrémité nord : le trajet doit passer par
-        // la jonction, pas couper en diagonale.
+        // West end to north end: the route must go through the junction rather
+        // than cut across.
         let from = net.snap(LatLon::new(45.0100, 6.0005), SNAP_RADIUS_M).unwrap();
         let to = net.snap(LatLon::new(45.0118, 6.0040), SNAP_RADIUS_M).unwrap();
         let from_pos = g.locate(&net, &from).unwrap();
@@ -588,23 +588,23 @@ mod tests {
             r.points
                 .iter()
                 .any(|p| (p.lat - 45.010).abs() < 1e-9 && (p.lon - 6.004).abs() < 1e-9),
-            "l'itinéraire doit passer par la jonction : {:?}",
+            "the route must pass through the junction: {:?}",
             r.points
         );
         assert!(r.cost_ms > 0);
     }
 
     #[test]
-    fn locate_place_le_point_sur_le_bon_troncon() {
+    fn locate_puts_the_point_on_the_right_stretch() {
         let net = cross();
         let g = Graph::build(&net);
-        // Juste à l'ouest de la jonction, sur le second segment du chemin 10.
+        // Just west of the junction, on the second segment of way 10.
         let snap = net.snap(LatLon::new(45.010, 6.0035), SNAP_RADIUS_M).unwrap();
         let pos = g.locate(&net, &snap).unwrap();
         let e = &g.edges[pos.edge as usize];
         assert_eq!(e.way_id, 10);
         assert!((pos.to_a_m + pos.to_b_m - e.len_m).abs() < 1e-6);
-        // ~117 m depuis le nœud 1, ~39 m avant la jonction.
-        assert!(pos.to_b_m < pos.to_a_m, "on est plus près de la jonction");
+        // ~117 m from node 1, ~39 m before the junction.
+        assert!(pos.to_b_m < pos.to_a_m, "we are nearer the junction");
     }
 }

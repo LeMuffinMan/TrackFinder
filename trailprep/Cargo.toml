@@ -1,0 +1,10 @@
+[package]
+name = "trailprep"
+version = "0.1.0"
+edition = "2021"
+
+# Build-time only: this crate never reaches the WASM bundle. It is what lets the
+# application ship static bytes instead of querying Overpass at runtime.
+[dependencies]
+trailfmt = { path = "../trailfmt" }
+osmpbf = "0.3"

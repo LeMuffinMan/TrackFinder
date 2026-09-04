@@ -1,29 +1,42 @@
-//! MNT : fetch → (inflate si besoin) → f32 little-endian → altitude en un point.
+//! DEM: fetch → (inflate if needed) → little-endian f32 → elevation at a point.
 //!
-//! 262 144 octets utiles = 256 × 256 × 4, little-endian. Aucun décodeur d'image.
+//! 262,144 useful bytes = 256 × 256 × 4, little-endian. No image decoder involved.
 //!
-//! ⚠️ La « compression zlib » du BIL est en réalité un `Content-Encoding: deflate`
-//! HTTP (vérifié le 03/09/2026 : `curl` seul renvoie 215 799 octets zlib,
-//! `curl --compressed` renvoie 262 144 octets bruts). Le `fetch` du navigateur
-//! décode ce header **de façon transparente et non désactivable** : en WASM les
-//! octets arrivent déjà inflatés. On accepte donc les deux formes.
+//! ⚠️ The BIL payload's "zlib compression" is really an HTTP
+//! `Content-Encoding: deflate` (checked 2026-09-03: plain `curl` returns 215,799
+//! zlib bytes, `curl --compressed` returns 262,144 raw ones). The browser's
+//! `fetch` decodes that header **transparently and unconditionally**, so under
+//! WASM the bytes arrive already inflated. Both forms are accepted.
 
 use std::rc::Rc;
 
 use crate::geo::{wgs84g, LatLon, TILE_PX};
 use crate::tiles::{Dataset, TileCache, TileDesc, TileSource};
 
-/// Zoom MNT du profil altimétrique : ~5 m/pixel, résolution validée sur Chamonix.
+/// DEM zoom for the elevation profile: ~5 m/pixel, resolution validated over
+/// Chamonix.
 pub const DEM_ZOOM: u8 = 14;
 
-/// Zoom MNT de la pondération du graphe : ~38 m/pixel, mais une tuile couvre
-/// ~10 km au lieu de 1,2 km. Un rayon d'isochrone de 25 km demande ainsi une
-/// trentaine de tuiles au lieu de plus de mille — c'est ce qui rend l'isochrone
-/// jouable sans pipeline de pré-traitement.
+/// DEM zoom used to weight the graph: ~38 m/pixel, but one tile covers ~10 km
+/// instead of 1.2 km. A 25 km isochrone radius therefore needs about thirty
+/// tiles instead of more than a thousand — that is what makes the isochrone
+/// playable without a pre-processing pipeline.
 pub const GRAPH_DEM_ZOOM: u8 = 11;
 
-/// Les tuiles en bord de couverture portent une valeur sentinelle très négative.
+/// Concurrent DEM requests. Its own budget, separate from the raster tiles: a
+/// long elevation profile asks for hundreds of tiles at once and must not starve
+/// the map of connections.
+const MAX_DEM_REQUESTS: usize = 8;
+
+/// Tiles on the edge of coverage carry a very negative sentinel value.
 const NODATA_THRESHOLD: f32 = -1000.0;
+
+/// Decoded DEM tiles handled per frame.
+///
+/// Decoding is a 256 KB copy (plus an inflate when running natively): cheap on
+/// its own, but a zoom change can land dozens of tiles in the same frame. The
+/// budget spreads that over several frames instead of one visible hitch.
+const DEM_DECODE_BUDGET: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DemKey {
@@ -33,7 +46,7 @@ pub struct DemKey {
 }
 
 pub struct DemTile {
-    /// 256 × 256 altitudes en mètres, ligne par ligne du nord au sud.
+    /// 256 × 256 elevations in metres, row by row from north to south.
     pub values: Vec<f32>,
 }
 
@@ -48,18 +61,18 @@ pub const DEM_BYTES: usize = (TILE_PX * TILE_PX) as usize * 4;
 
 pub fn decode_bil(bytes: &[u8]) -> Result<DemTile, String> {
     let raw = if bytes.len() == DEM_BYTES {
-        // Déjà décodé par la couche HTTP (cas du navigateur).
+        // Already decoded by the HTTP layer (the browser case).
         std::borrow::Cow::Borrowed(bytes)
     } else {
         std::borrow::Cow::Owned(
             miniz_oxide::inflate::decompress_to_vec_zlib(bytes)
-                .map_err(|e| format!("inflate zlib : {e:?}"))?,
+                .map_err(|e| format!("zlib inflate: {e:?}"))?,
         )
     };
     let expected = DEM_BYTES;
     if raw.len() != expected {
         return Err(format!(
-            "taille MNT inattendue : {} octets au lieu de {expected}",
+            "unexpected DEM size: {} bytes instead of {expected}",
             raw.len()
         ));
     }
@@ -75,13 +88,14 @@ pub struct DemStore {
 impl DemStore {
     pub fn new(source: Rc<dyn TileSource>) -> Self {
         Self {
-            cache: TileCache::new(source, 128),
+            cache: TileCache::new(source, 128, MAX_DEM_REQUESTS),
         }
     }
 
-    pub fn begin_frame(&mut self) {
+    pub fn begin_frame(&mut self, ctx: &egui::Context) {
         self.cache.tick();
-        self.cache.pump(|_, bytes| decode_bil(bytes));
+        self.cache
+            .pump(DEM_DECODE_BUDGET, ctx, |_, bytes| decode_bil(bytes));
     }
 
     pub fn end_frame(&mut self) {
@@ -92,8 +106,13 @@ impl DemStore {
         self.cache.stats()
     }
 
-    /// Altitude d'un pixel MNT global (indices sur toute la pyramide, au zoom donné).
-    /// Déclenche le chargement de la tuile manquante.
+    /// DEM requests currently on the wire.
+    pub fn in_flight(&self) -> usize {
+        self.cache.in_flight()
+    }
+
+    /// Elevation of one global DEM pixel (pyramid-wide indices, at the given
+    /// zoom). Triggers the fetch of a missing tile.
     fn pixel(&mut self, gi: i64, gj: i64, zoom: u8, ctx: &egui::Context) -> Option<f32> {
         if gj < 0 {
             return None;
@@ -118,18 +137,19 @@ impl DemStore {
         self.cache.peek(&key)?.sample(px, py)
     }
 
-    /// Altitude interpolée bilinéairement au zoom du profil.
+    /// Bilinearly interpolated elevation at the profile zoom.
     pub fn elevation(&mut self, ll: LatLon, ctx: &egui::Context) -> Option<f32> {
         self.elevation_at(ll, DEM_ZOOM, ctx)
     }
 
-    /// Altitude interpolée bilinéairement, y compris à cheval sur quatre tuiles.
-    /// `None` = tuiles pas encore là (ou hors couverture) — l'appelant réessaiera
-    /// à la frame suivante, le `request_repaint` du cache la provoquera.
+    /// Bilinearly interpolated elevation, including across four tiles.
+    /// `None` means the tiles are not here yet (or the point is outside
+    /// coverage) — the caller retries next frame, driven by the cache's
+    /// `request_repaint`.
     pub fn elevation_at(&mut self, ll: LatLon, zoom: u8, ctx: &egui::Context) -> Option<f32> {
         let span = wgs84g::span_deg(zoom);
         let side = TILE_PX as f64;
-        // Coordonnées en pixels sur toute la pyramide, recalées sur les centres.
+        // Pyramid-wide pixel coordinates, shifted onto pixel centres.
         let gx = (ll.lon + 180.0) / span * side - 0.5;
         let gy = (90.0 - ll.lat) / span * side - 0.5;
         let i0 = gx.floor();
@@ -163,7 +183,7 @@ mod tests {
 
     #[test]
     fn decode_accepts_already_inflated_bytes() {
-        // Cas navigateur : Content-Encoding: deflate déjà décodé par fetch.
+        // Browser case: Content-Encoding: deflate already handled by fetch.
         let mut values = vec![0.0f32; (TILE_PX * TILE_PX) as usize];
         values[1] = 2400.0;
         let mut raw = Vec::new();
@@ -197,14 +217,14 @@ mod tests {
     #[test]
     fn wrong_size_is_reported() {
         let err = decode_bil(&zlib(&[1.0, 2.0])).err().unwrap();
-        assert!(err.contains("taille MNT inattendue"), "{err}");
+        assert!(err.contains("unexpected DEM size"), "{err}");
     }
 
-    /// Bout en bout contre le vrai service (natif) : `cargo test -- --ignored`.
+    /// End to end against the real service (native): `cargo test -- --ignored`.
     #[test]
-    #[ignore = "réseau"]
+    #[ignore = "network"]
     #[cfg(not(target_arch = "wasm32"))]
-    fn tuile_reelle_chamonix() {
+    fn real_tile_over_chamonix() {
         use crate::tiles::{Dataset, HttpTileSource, TileDesc};
         let desc = TileDesc {
             dataset: Dataset::Elevation,
@@ -219,14 +239,14 @@ mod tests {
         let alts: Vec<f32> = tile.values.iter().copied().filter(|v| *v > -1000.0).collect();
         let min = alts.iter().copied().fold(f32::MAX, f32::min);
         let max = alts.iter().copied().fold(f32::MIN, f32::max);
-        // Vallée de Chamonix : 1043-1827 m relevés le 02/09/2026.
+        // Chamonix valley: 1043-1827 m recorded on 2026-09-02.
         assert!((min - 1042.6).abs() < 5.0, "min = {min}");
         assert!((max - 1827.2).abs() < 5.0, "max = {max}");
     }
 
     #[test]
     fn raw_bytes_are_not_mistaken_for_data() {
-        // Lire la charge BIL sans inflate donnerait du bruit : on doit échouer net.
+        // Reading the BIL payload without inflating would yield noise: fail loudly.
         assert!(decode_bil(&[0u8; 1024]).is_err());
     }
 }

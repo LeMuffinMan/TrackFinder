@@ -1,23 +1,29 @@
-name: Déploiement GitHub Pages
+name: GitHub Pages deployment
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
-# Droits requis par le déploiement Pages par artefact.
+# Rights required by artifact-based Pages deployment.
 permissions:
   contents: read
   pages: write
   id-token: write
 
-# Un seul déploiement à la fois ; on laisse finir celui en cours.
+# One deployment at a time; let the running one finish.
 concurrency:
   group: pages
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  # Bump to pull fresh OSM data. Trail archives are a dated snapshot, and
+  # rebuilding them takes several minutes: without this key they would be
+  # regenerated on every push for data that has not meaningfully changed.
+  DATA_EPOCH: "2026-09"
+  # The French Alps, matching the application's opening view.
+  ALPS_BBOX: "43.95,5.35,46.45,7.75"
 
 jobs:
   build:
@@ -32,10 +38,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # `cargo test` compile la cible native, donc winit/glutin : sur un runner
-      # nu, ces dépendances système manquent. La cible wasm, elle, n'en a pas
-      # besoin.
-      - name: Dépendances système (build natif des tests)
+      # `cargo test` builds the native target, hence winit/glutin: a bare runner
+      # lacks those system libraries. The wasm target does not need them.
+      - name: System dependencies (native test build)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -47,21 +52,77 @@ jobs:
         with:
           version: latest
 
-      # Les tests réseau sont #[ignore] : la CI ne dépend ni d'Overpass ni de l'IGN.
+      # Network tests are #[ignore]: CI depends on neither Overpass nor IGN.
       - name: Tests
-        run: cargo test --locked
+        run: |
+          cargo test --locked
+          cargo test --locked --manifest-path trailfmt/Cargo.toml
 
-      # Informatif, jamais bloquant : clippy suit la version stable du runner et
-      # gagne des règles à chaque sortie. Un lint neuf ne doit pas empêcher un
-      # déploiement — les tests, eux, restent bloquants.
+      # Informative, never blocking: clippy follows the runner's stable release
+      # and gains lints with every version. A new lint must not stop a
+      # deployment — the tests, on the other hand, stay blocking.
       - name: Clippy
         continue-on-error: true
         run: cargo clippy --locked --target wasm32-unknown-unknown --all-targets -- -D warnings
 
-      # Le site est servi depuis /TrackFinder/ : sans --public-url, le HTML
-      # chercherait le .wasm à la racine du domaine et n'afficherait rien.
+      # The archives are generated, never committed: a regenerated 30 MB blob in
+      # git history would be there for good. The cache key covers the
+      # preprocessor's own sources, so changing the format regenerates the data.
+      - name: Trail archive cache
+        id: trails-cache
+        uses: actions/cache@v4
+        with:
+          path: data/trails
+          key: trails-${{ env.DATA_EPOCH }}-${{ env.ALPS_BBOX }}-${{ hashFiles('trailprep/src/**', 'trailfmt/src/**') }}
+
+      # ~850 MB of extracts in, ~2 GB of RAM, a few minutes of CPU. Measured on
+      # 2026-09-04: Rhône-Alpes alone peaked at 1.08 GB and took 219 s.
+      - name: Build trail archives
+        if: steps.trails-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p data/extracts data/trails
+          for region in rhone-alpes provence-alpes-cote-d-azur; do
+            echo "downloading $region"
+            curl -sSL --retry 3 --retry-delay 5 \
+              -o "data/extracts/$region.osm.pbf" \
+              "https://download.geofabrik.de/europe/france/$region-latest.osm.pbf"
+          done
+          # Both extracts in one run, deliberately: a node shared by two ways on
+          # either side of the regional boundary is only seen as a junction if
+          # both files are counted together.
+          cargo run --release --locked -p trailprep -- \
+            --name "Alpes françaises" \
+            --out data/trails/alps.tft \
+            --bbox "$ALPS_BBOX" \
+            data/extracts/*.osm.pbf
+          rm -rf data/extracts
+          ls -la data/trails
+
+      # The site is served from /TrackFinder/: without --public-url the HTML
+      # would look for the .wasm at the domain root and show nothing.
       - name: Build
         run: trunk build --release --public-url "/${GITHUB_REPOSITORY#*/}/"
+
+      # After `trunk build`, which wipes dist. The manifest is assembled from the
+      # fragments each preprocessor run writes, so a bounding box is never
+      # repeated by hand and can never drift from what was actually built.
+      - name: Publish trail archives
+        run: |
+          set -euo pipefail
+          mkdir -p dist/trails
+          cp data/trails/*.tft dist/trails/
+          {
+            printf '{"regions":['
+            # `cat | paste -sd,` and not `paste -sd, files...`: the latter
+            # serialises each file onto its own line instead of joining across
+            # them, which is valid JSON only as long as there is exactly one
+            # region — it would break the day a second massif is added.
+            cat data/trails/*.tft.json | paste -sd,
+            printf ']}'
+          } > dist/trails/regions.json
+          cat dist/trails/regions.json
+          du -sh dist/trails
 
       - uses: actions/configure-pages@v5
 

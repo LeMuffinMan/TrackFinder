@@ -1,0 +1,8 @@
+[package]
+name = "trailfmt"
+version = "0.1.0"
+edition = "2021"
+
+# No dependencies, deliberately: this crate is shared by the WASM application
+# and by the offline preprocessor, and neither should drag the other's world in.
+[dependencies]

@@ -1,14 +1,14 @@
-//! Tracé : polyligne, échantillonnage, profil altimétrique, temps de marche.
+//! Track: polyline, sampling, elevation profile, walking time.
 
 use crate::dem::DemStore;
 use crate::geo::{haversine_m, lerp_latlon, LatLon};
 use crate::trails::{Snap, TrailNetwork};
 
-/// Pas d'échantillonnage du profil. 50 m est plus fin que le MNT (~5 m/px au
-/// zoom 14) sans faire exploser le nombre de tuiles demandées.
+/// Profile sampling step. 50 m is finer than the DEM (~5 m/px at zoom 14)
+/// without blowing up the number of tiles requested.
 const STEP_M: f64 = 50.0;
 const MAX_SAMPLES: usize = 4000;
-/// Hystérésis sur le dénivelé : sans ça le bruit du MNT gonfle le D+.
+/// Hysteresis on climb: without it DEM noise inflates the total ascent.
 const ASCENT_THRESHOLD_M: f32 = 3.0;
 
 #[derive(Clone, Copy, Debug)]
@@ -20,9 +20,9 @@ pub struct Sample {
 
 #[derive(Clone, Copy, Debug)]
 pub struct WalkSettings {
-    /// Vitesse sur le plat, km/h (base Naismith : 5).
+    /// Speed on the flat, km/h (Naismith baseline: 5).
     pub flat_kmh: f64,
-    /// Vitesse d'ascension, m/h (base Naismith : 600).
+    /// Ascent rate, m/h (Naismith baseline: 600).
     pub ascent_mh: f64,
     pub body_weight_kg: f64,
     pub pack_weight_kg: f64,
@@ -40,12 +40,12 @@ impl Default for WalkSettings {
 }
 
 impl WalkSettings {
-    /// facteur_vitesse = 1 − 0.01 × max(0, poids_sac − 10)
+    /// speed_factor = 1 − 0.01 × max(0, pack_weight − 10)
     pub fn speed_factor(&self) -> f64 {
         1.0 - 0.01 * (self.pack_weight_kg - 10.0).max(0.0)
     }
 
-    /// seuil_charge = poids_corporel × 0.20
+    /// load_limit = body_weight × 0.20
     pub fn load_limit_kg(&self) -> f64 {
         self.body_weight_kg * 0.20
     }
@@ -63,19 +63,19 @@ pub struct TrackStats {
     pub min_elev_m: Option<f32>,
     pub max_elev_m: Option<f32>,
     pub time_h: f64,
-    /// Faux tant que des tuiles MNT manquent : les chiffres sont partiels.
+    /// False while DEM tiles are missing: the figures are partial.
     pub elevation_complete: bool,
 }
 
-/// Un point posé par l'utilisateur. `snap` est renseigné quand le point a été
-/// accroché à un sentier OSM — c'est lui qui permet le suivi de tronçon.
+/// A point placed by the user. `snap` is filled in when the point was snapped
+/// onto an OSM trail — that is what makes segment following possible.
 #[derive(Clone, Debug)]
 pub struct Waypoint {
     pub pos: LatLon,
     pub snap: Option<Snap>,
-    /// Géométrie depuis le waypoint précédent, quand elle vient du graphe (M2).
-    /// Prioritaire sur le suivi de tronçon, qui ne sait relier que deux points
-    /// d'un même chemin OSM.
+    /// Geometry from the previous waypoint, when it comes from the graph. Takes
+    /// precedence over segment following, which can only join two points of one
+    /// and the same OSM way.
     pub via: Option<Vec<LatLon>>,
 }
 
@@ -108,8 +108,8 @@ impl Waypoint {
 #[derive(Default)]
 pub struct Track {
     pub waypoints: Vec<Waypoint>,
-    /// Géométrie réellement parcourue : suit les sentiers entre deux waypoints
-    /// accrochés au même chemin OSM, ligne droite sinon (le routage arrive en M2).
+    /// Geometry actually walked: follows the trails between two waypoints snapped
+    /// to the same OSM way, a straight line otherwise.
     path: Vec<LatLon>,
     profile: Vec<Sample>,
     stats: TrackStats,
@@ -132,8 +132,8 @@ impl Track {
         self.dirty = true;
     }
 
-    /// À appeler quand le réseau de sentiers a changé : un tronçon manquant
-    /// jusque-là peut désormais être suivi.
+    /// Call when the trail network changed: a stretch that was missing until now
+    /// may become followable.
     pub fn invalidate(&mut self) {
         self.dirty = true;
     }
@@ -150,7 +150,7 @@ impl Track {
         &self.stats
     }
 
-    /// Nombre de liaisons suivant réellement un sentier.
+    /// Number of legs that actually follow a trail.
     pub fn followed_legs(&self, net: &TrailNetwork) -> usize {
         self.waypoints
             .windows(2)
@@ -166,15 +166,15 @@ impl Track {
         self.path.push(first.pos);
         for pair in self.waypoints.windows(2) {
             match leg_geometry(net, &pair[0], &pair[1]) {
-                // Le premier point de la géométrie est déjà dans `path`.
+                // The first point of the geometry is already in `path`.
                 Some(geom) => self.path.extend(geom.into_iter().skip(1)),
                 None => self.path.push(pair[1].pos),
             }
         }
     }
 
-    /// Recalcule si nécessaire. Tant que le MNT n'est pas complet on recalcule à
-    /// chaque frame : les tuiles arrivent au fil de l'eau et complètent le profil.
+    /// Recomputes when needed. While the DEM is incomplete this runs every frame:
+    /// tiles trickle in and gradually complete the profile.
     pub fn refresh(
         &mut self,
         net: &TrailNetwork,
@@ -198,13 +198,13 @@ impl Track {
         self.stats = compute_stats(&self.profile, settings, complete);
     }
 
-    /// Recalcule seulement le temps (changement de réglage, sans retoucher au MNT).
+    /// Recomputes the time only (a settings change, without touching the DEM).
     pub fn recompute_time(&mut self, settings: &WalkSettings) {
         self.stats = compute_stats(&self.profile, settings, self.stats.elevation_complete);
     }
 }
 
-/// Géométrie d'une liaison entre deux waypoints, si elle suit un sentier connu.
+/// Geometry of a leg between two waypoints, when it follows a known trail.
 fn leg_geometry(net: &TrailNetwork, a: &Waypoint, b: &Waypoint) -> Option<Vec<LatLon>> {
     if let Some(via) = &b.via {
         return Some(via.clone());
@@ -212,7 +212,7 @@ fn leg_geometry(net: &TrailNetwork, a: &Waypoint, b: &Waypoint) -> Option<Vec<La
     net.follow(a.snap.as_ref()?, b.snap.as_ref()?)
 }
 
-/// Découpe la polyligne en points espacés d'environ `STEP_M`, sommets compris.
+/// Splits the polyline into points about `STEP_M` apart, vertices included.
 fn sample_polyline(points: &[LatLon]) -> Vec<Sample> {
     let mut out = Vec::new();
     if points.is_empty() {
@@ -253,8 +253,8 @@ fn compute_stats(profile: &[Sample], settings: &WalkSettings, complete: bool) ->
         ..Default::default()
     };
 
-    // Dénivelés avec hystérésis : on n'enregistre un changement de sens qu'au-delà
-    // du seuil, ce qui écarte le bruit du MNT.
+    // Climb with hysteresis: a change of direction is only recorded past the
+    // threshold, which discards DEM noise.
     let mut anchor: Option<f32> = None;
     for s in profile.iter().filter_map(|s| s.elev_m) {
         stats.min_elev_m = Some(stats.min_elev_m.map_or(s, |m: f32| m.min(s)));
@@ -274,7 +274,7 @@ fn compute_stats(profile: &[Sample], settings: &WalkSettings, complete: bool) ->
         }
     }
 
-    // Naismith : plat + ascension, corrigé du facteur de charge.
+    // Naismith: flat + ascent, corrected by the load factor.
     let factor = settings.speed_factor().max(0.1);
     let flat_h = (stats.distance_m / 1000.0) / settings.flat_kmh.max(0.1);
     let up_h = stats.ascent_m / settings.ascent_mh.max(1.0);
@@ -308,13 +308,13 @@ mod tests {
     }
 
     #[test]
-    fn charge_penalise_la_vitesse() {
+    fn load_penalises_speed() {
         let s = WalkSettings {
             pack_weight_kg: 20.0,
             ..Default::default()
         };
         assert!((s.speed_factor() - 0.90).abs() < 1e-9);
-        // Sous 10 kg, aucune pénalité.
+        // Below 10 kg, no penalty.
         let light = WalkSettings {
             pack_weight_kg: 8.0,
             ..Default::default()
@@ -323,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn seuil_de_charge_a_20_pourcent() {
+    fn load_limit_is_twenty_percent() {
         let s = WalkSettings {
             body_weight_kg: 70.0,
             pack_weight_kg: 15.0,
@@ -334,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn naismith_plat() {
+    fn naismith_on_the_flat() {
         let s = WalkSettings {
             pack_weight_kg: 0.0,
             ..Default::default()
@@ -345,21 +345,21 @@ mod tests {
     }
 
     #[test]
-    fn naismith_ascension() {
+    fn naismith_with_ascent() {
         let s = WalkSettings {
             pack_weight_kg: 0.0,
             ..Default::default()
         };
-        // 5 km plat (1 h) + 600 m de montée (1 h)
+        // 5 km flat (1 h) + 600 m of climb (1 h)
         let stats = compute_stats(&samples(&[1000.0, 1600.0], 5_000.0), &s, true);
         assert!((stats.ascent_m - 600.0).abs() < 1e-6);
         assert!((stats.time_h - 2.0).abs() < 1e-6, "{}", stats.time_h);
     }
 
     #[test]
-    fn hysteresis_filtre_le_bruit_du_mnt() {
+    fn hysteresis_filters_dem_noise() {
         let s = WalkSettings::default();
-        // Oscillations de ±1 m : du bruit, pas du dénivelé.
+        // ±1 m wobble: noise, not climb.
         let noisy: Vec<f32> = (0..100)
             .map(|i| 1000.0 + if i % 2 == 0 { 1.0 } else { -1.0 })
             .collect();
@@ -367,17 +367,17 @@ mod tests {
         assert_eq!(stats.ascent_m, 0.0);
         assert_eq!(stats.descent_m, 0.0);
 
-        // Une vraie montée de 100 m est bien comptée.
+        // A genuine 100 m climb is still counted.
         let real = compute_stats(&samples(&[1000.0, 1050.0, 1100.0], 1000.0), &s, true);
         assert!((real.ascent_m - 100.0).abs() < 1e-6);
     }
 
     #[test]
-    fn echantillonnage_respecte_le_pas() {
-        // ~1.11 km nord-sud
+    fn sampling_respects_the_step() {
+        // ~1.11 km north-south
         let pts = vec![LatLon::new(45.0, 6.0), LatLon::new(45.01, 6.0)];
         let out = sample_polyline(&pts);
-        assert!(out.len() > 20, "{} échantillons", out.len());
+        assert!(out.len() > 20, "{} samples", out.len());
         for w in out.windows(2) {
             assert!(w[1].dist_m - w[0].dist_m <= STEP_M + 1.0);
         }
@@ -385,22 +385,22 @@ mod tests {
     }
 
     #[test]
-    fn echantillonnage_plafonne() {
-        // 100 km : le pas s'élargit au lieu de faire exploser le nombre de points.
+    fn sampling_is_capped() {
+        // 100 km: the step widens instead of exploding the number of points.
         let pts = vec![LatLon::new(45.0, 6.0), LatLon::new(45.9, 6.0)];
         let out = sample_polyline(&pts);
-        assert!(out.len() <= MAX_SAMPLES + 2, "{} échantillons", out.len());
+        assert!(out.len() <= MAX_SAMPLES + 2, "{} samples", out.len());
     }
 
     #[test]
-    fn duree_formatee() {
+    fn duration_formatting() {
         assert_eq!(format_duration(2.5), "2 h 30");
         assert_eq!(format_duration(0.0), "—");
     }
 }
 
-/// Intégration M0 + M1 sans interface : Overpass → snap → suivi de tronçon →
-/// MNT → Naismith. `cargo test -- --ignored`.
+/// Headless integration: Overpass → snap → segment following → DEM → Naismith.
+/// `cargo test -- --ignored`.
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod integration {
@@ -411,8 +411,8 @@ mod integration {
     use std::rc::Rc;
 
     #[test]
-    #[ignore = "réseau"]
-    fn etape_reelle_a_chamonix() {
+    #[ignore = "network"]
+    fn a_real_leg_at_chamonix() {
         let ctx = egui::Context::default();
         let zone = ZoneKey::of(LatLon::new(45.92, 6.87));
         let mut net = TrailNetwork::default();
@@ -420,13 +420,13 @@ mod integration {
             net.insert(way);
         }
 
-        // Deux points pris sur un même chemin OSM long : le tracé doit suivre sa
-        // géométrie, pas la corde.
+        // Two points on one long OSM way: the track must follow its geometry,
+        // not the chord.
         let way = net
             .ways()
             .iter()
             .max_by_key(|w| w.points.len())
-            .expect("réseau non vide");
+            .expect("non-empty network");
         let (a_pos, b_pos) = (way.points[1], way.points[way.points.len() - 2]);
         let way_id = way.id;
 
@@ -441,10 +441,10 @@ mod integration {
         let settings = WalkSettings::default();
         let mut dem = DemStore::new(Rc::new(HttpTileSource::default()));
 
-        // Les tuiles MNT arrivent de façon asynchrone : on tourne comme le ferait
-        // la boucle de rendu jusqu'à ce que le profil soit complet.
+        // DEM tiles arrive asynchronously: spin like the render loop would until
+        // the profile is complete.
         for _ in 0..200 {
-            dem.begin_frame();
+            dem.begin_frame(&ctx);
             track.refresh(&net, &mut dem, &settings, &ctx);
             if track.stats().elevation_complete {
                 break;
@@ -453,12 +453,12 @@ mod integration {
         }
 
         let stats = *track.stats();
-        assert!(stats.elevation_complete, "MNT incomplet après 10 s");
-        assert!(track.path().len() > 2, "le tracé doit suivre la géométrie");
+        assert!(stats.elevation_complete, "DEM still incomplete after 10 s");
+        assert!(track.path().len() > 2, "the track must follow the geometry");
         assert!(stats.distance_m > 0.0);
         assert!(
             (500.0..4500.0).contains(&stats.min_elev_m.unwrap()),
-            "altitude hors des Alpes : {:?}",
+            "elevation outside the Alps: {:?}",
             stats.min_elev_m
         );
         assert!(stats.time_h > 0.0);

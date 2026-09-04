@@ -1,8 +1,10 @@
 mod app;
+mod archive;
 mod dem;
 mod geo;
 mod graph;
 mod map;
+mod terrain;
 mod tiles;
 mod track;
 mod trails;
@@ -20,13 +22,13 @@ fn main() {
         use eframe::wasm_bindgen::JsCast as _;
 
         let canvas = web_sys::window()
-            .expect("pas de window")
+            .expect("no window")
             .document()
-            .expect("pas de document")
+            .expect("no document")
             .get_element_by_id("trackfinder_canvas")
-            .expect("canvas trackfinder_canvas introuvable")
+            .expect("canvas trackfinder_canvas not found")
             .dyn_into::<web_sys::HtmlCanvasElement>()
-            .expect("l'element n'est pas un canvas");
+            .expect("that element is not a canvas");
 
         eframe::WebRunner::new()
             .start(
@@ -35,7 +37,7 @@ fn main() {
                 Box::new(|_cc| Ok(Box::new(TrackFinderApp::new()))),
             )
             .await
-            .expect("echec du demarrage eframe");
+            .expect("eframe failed to start");
     });
 }
 
