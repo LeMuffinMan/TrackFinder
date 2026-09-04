@@ -1,11 +1,14 @@
-//! Offline preprocessor: OSM extracts → one binary trail archive.
+//! Offline preprocessor: OSM extracts → a directory of binary trail tiles.
 //!
 //! Run from CI, never at runtime:
 //!
 //! ```text
-//! trailprep --out dist/trails-alps.tft --bbox 43.95,5.35,46.45,7.75 \
+//! trailprep --name "Alpes" --out dist/trails/alps --bbox 43.95,5.35,46.45,7.75 \
 //!     rhone-alpes-latest.osm.pbf provence-alpes-cote-d-azur-latest.osm.pbf
 //! ```
+//!
+//! `--out` is a **directory**: one file per tile plus an index. See `trailfmt`
+//! for why a single archive addressed by byte ranges had to be abandoned.
 //!
 //! ## Why three passes
 //!
@@ -239,25 +242,45 @@ fn main() {
         });
     }
 
-    let entries: Vec<(TileId, Vec<ArchiveWay>)> = tiles.into_iter().collect();
-    let archive = trailfmt::write_archive(trailfmt::TILE_ZOOM, &entries);
-    std::fs::write(&out, &archive).expect("cannot write the archive");
+    // One file per tile, plus an index of which tiles exist. Empty tiles are
+    // never written: the Alps are largely rock and ice, and a file per empty
+    // tile would be pure overhead on the CDN and in the index.
+    let zoom = trailfmt::TILE_ZOOM;
+    std::fs::create_dir_all(&out).expect("cannot create the output directory");
+    let mut published: Vec<TileId> = Vec::new();
+    let mut total_bytes = 0usize;
+    for (tile, ways) in &tiles {
+        if ways.is_empty() {
+            continue;
+        }
+        let blob = trailfmt::encode_tile(ways);
+        let path = out.join(trailfmt::tile_path(zoom, *tile));
+        std::fs::create_dir_all(path.parent().expect("tile path has a parent"))
+            .expect("cannot create the tile directory");
+        std::fs::write(&path, &blob).expect("cannot write a tile");
+        total_bytes += blob.len();
+        published.push(*tile);
+    }
+    published.sort_by_key(|t| (t.x, t.y));
+    let index = trailfmt::write_index(zoom, &published);
+    std::fs::write(out.join(trailfmt::INDEX_FILE), &index).expect("cannot write the index");
+    total_bytes += index.len();
 
     // A one-line manifest fragment beside the archive. The bounding box lives in
     // exactly one place — the command line — instead of being repeated in a
     // hand-written manifest that would drift from what was actually built.
-    let file_name = out
+    let dir_name = out
         .file_name()
         .and_then(|f| f.to_str())
-        .expect("--out needs a file name");
+        .expect("--out needs a directory name");
     // One line, newline-terminated: the manifest is assembled by joining these
     // fragments, and a missing newline silently glues two regions together.
     let fragment = format!(
         "{}\n",
         format_args!(
-            r#"{{"name":"{}","file":"{}","south":{},"west":{},"north":{},"east":{}}}"#,
+            r#"{{"name":"{}","dir":"{}","south":{},"west":{},"north":{},"east":{}}}"#,
             json_escape(&name),
-            json_escape(file_name),
+            json_escape(dir_name),
             bbox.south,
             bbox.west,
             bbox.north,
@@ -268,35 +291,46 @@ fn main() {
     fragment_path.push(".json");
     std::fs::write(&fragment_path, &fragment).expect("cannot write the manifest fragment");
 
-    verify(&archive, kept, total_points);
+    verify(&out, zoom, &published, kept, total_points);
 
     eprintln!(
         "kept {kept} ways ({total_points} points) in {} tiles · dropped {dropped_outside} outside, {dropped_incomplete} incomplete",
-        entries.len()
+        published.len()
     );
     eprintln!(
-        "{} → {:.1} MB, {:.2} bytes/point",
+        "{} → {} tiles, {:.1} MB, {:.2} bytes/point",
         out.display(),
-        archive.len() as f64 / 1_048_576.0,
-        archive.len() as f64 / total_points.max(1) as f64
+        published.len(),
+        total_bytes as f64 / 1_048_576.0,
+        total_bytes as f64 / total_points.max(1) as f64
     );
 }
 
-/// Reads the archive straight back and checks it holds what we meant to write.
+/// Reads every published tile straight back and checks it holds what we meant
+/// to write.
 ///
-/// CI publishes this file without a human ever opening it; a silent encoding bug
-/// would reach the application as missing trails, which looks exactly like a
-/// region with no paths. Decoding costs a second — refusing to ship a bad archive
-/// is worth far more than that.
-fn verify(archive: &[u8], expected_ways: usize, expected_points: usize) {
-    let index = trailfmt::read_index(archive).expect("the archive we just wrote is unreadable");
+/// CI publishes these files without a human ever opening them; a silent encoding
+/// bug would reach the application as missing trails, which looks exactly like a
+/// region with no paths. Decoding costs a second — refusing to ship bad data is
+/// worth far more than that.
+fn verify(
+    dir: &std::path::Path,
+    zoom: u8,
+    published: &[TileId],
+    expected_ways: usize,
+    expected_points: usize,
+) {
+    let index_bytes = std::fs::read(dir.join(trailfmt::INDEX_FILE)).expect("index unreadable");
+    let index = trailfmt::read_index(&index_bytes).expect("the index we just wrote is unreadable");
+    assert_eq!(index.zoom, zoom);
+    assert_eq!(index.tiles.len(), published.len(), "index and tiles disagree");
+
     let (mut ways, mut points) = (0usize, 0usize);
-    for span in &index.spans {
-        let start = span.offset as usize;
-        let blob = archive
-            .get(start..start + span.len as usize)
-            .expect("index points outside the archive");
-        for way in trailfmt::decode_tile(blob).expect("a tile failed to decode") {
+    for tile in &index.tiles {
+        let path = dir.join(trailfmt::tile_path(zoom, *tile));
+        let blob = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("the index names {} but {e}", path.display()));
+        for way in trailfmt::decode_tile(&blob).expect("a tile failed to decode") {
             assert!(way.is_valid(), "way {} decoded misaligned", way.id);
             ways += 1;
             points += way.points.len();
@@ -304,5 +338,8 @@ fn verify(archive: &[u8], expected_ways: usize, expected_points: usize) {
     }
     assert_eq!(ways, expected_ways, "ways lost between encode and decode");
     assert_eq!(points, expected_points, "points lost between encode and decode");
-    eprintln!("verified: {ways} ways / {points} points read back from the archive");
+    eprintln!(
+        "verified: {ways} ways / {points} points read back from {} tiles",
+        index.tiles.len()
+    );
 }

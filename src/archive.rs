@@ -1,34 +1,31 @@
-//! Reading trail archives over HTTP range requests.
+//! Reading trail tiles from static files.
 //!
-//! Replaces Overpass. The data is a static file next to the `.wasm`, on the same
-//! origin, behind a CDN — see `etat-code.md` for the measurements that killed the
-//! query-service approach.
+//! Replaces Overpass. The data sits next to the `.wasm`, on the same origin,
+//! behind a CDN — see `etat-code.md` for the measurements that killed the
+//! query-service approach, and `trailfmt` for why the tiles are separate files
+//! rather than ranges into one archive.
 //!
-//! Three layers, each fetched once:
-//!
-//! 1. the **manifest**, listing regions and their bounding boxes;
-//! 2. a region's **index**, a couple of kilobytes naming every tile's byte range;
-//! 3. the **tiles** themselves, as coalesced range requests.
+//! Two layers: the **manifest** naming regions, then one **tile** per request.
+//! A region's index says which tiles exist, so empty ground costs nothing.
 
 // ⚠️ Temporary: nothing in the application reaches this module yet. Overpass is
-// still what feeds the network, and it stays until CI publishes a real archive —
-// removing it first would deploy a map with no trails at all. **Delete this
-// attribute in the same change that wires `TrailArchive` into `app.rs`**, so the
-// compiler starts guarding this module against real dead code again.
+// still what feeds the network. **Delete this attribute in the same change that
+// wires `TrailArchive` into `app.rs`**, so the compiler starts guarding this
+// module against real dead code again.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
-use trailfmt::{Index, TileId, TileSpan};
+use trailfmt::{Index, TileId};
 
 use crate::geo::LatLon;
 
 /// Where the data lives, relative to the page under WASM.
 ///
 /// Natively there is no page to be relative to, so development expects
-/// `trunk serve` on its default port. The archives are never committed: CI
-/// generates them, and a local run needs `trailprep` to have written them into
-/// `dist/trails/` first.
+/// `trunk serve` on its default port. The tiles are never committed: CI
+/// generates them.
 #[cfg(target_arch = "wasm32")]
 pub const DATA_BASE: &str = "trails/";
 #[cfg(not(target_arch = "wasm32"))]
@@ -36,18 +33,11 @@ pub const DATA_BASE: &str = "http://localhost:8080/trails/";
 
 pub const MANIFEST_FILE: &str = "regions.json";
 
-/// Byte gap small enough that swallowing it beats a second round trip.
-///
-/// A request costs a round trip — tens of milliseconds — while 64 KB off a CDN
-/// costs a handful. Merging across small holes turns a 5 × 5 block of tiles into
-/// a handful of requests instead of twenty-five.
-pub const MAX_COALESCE_GAP: u64 = 64 * 1024;
-
-/// One region of the world, with its own archive file.
+/// One region of the world, with its own directory of tiles.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Region {
     pub name: String,
-    pub file: String,
+    pub dir: String,
     pub south: f64,
     pub west: f64,
     pub north: f64,
@@ -60,18 +50,16 @@ impl Region {
     }
 }
 
-/// The list of regions the deployment carries.
+/// The regions this deployment carries.
 ///
-/// ⚠️ Deliberately a list from day one, not a single hard-coded archive URL.
-/// Adding a massif then costs one `trailprep` run and one line here; hard-coding
-/// one file would mean reworking this module instead.
+/// ⚠️ Deliberately a list from day one, not a single hard-coded path. Adding a
+/// massif then costs one `trailprep` run and one line here.
 #[derive(Clone, Debug, Default)]
 pub struct Manifest {
     pub regions: Vec<Region>,
 }
 
 impl Manifest {
-    /// The region covering this point, if the deployment carries one.
     pub fn region_for(&self, ll: LatLon) -> Option<&Region> {
         self.regions.iter().find(|r| r.contains(ll))
     }
@@ -87,16 +75,16 @@ pub fn parse_manifest(body: &str) -> Result<Manifest, String> {
 
     let mut regions = Vec::new();
     for r in list {
-        let field = |k: &str| r.get(k).and_then(|v| v.as_f64());
+        let number = |k: &str| r.get(k).and_then(|v| v.as_f64());
         let text = |k: &str| r.get(k).and_then(|v| v.as_str()).map(|s| s.to_owned());
-        let (Some(name), Some(file)) = (text("name"), text("file")) else {
-            return Err("a region is missing `name` or `file`".to_owned());
+        let (Some(name), Some(dir)) = (text("name"), text("dir")) else {
+            return Err("a region is missing `name` or `dir`".to_owned());
         };
         let (Some(south), Some(west), Some(north), Some(east)) = (
-            field("south"),
-            field("west"),
-            field("north"),
-            field("east"),
+            number("south"),
+            number("west"),
+            number("north"),
+            number("east"),
         ) else {
             return Err(format!("region `{name}` is missing part of its bbox"));
         };
@@ -105,7 +93,7 @@ pub fn parse_manifest(body: &str) -> Result<Manifest, String> {
         }
         regions.push(Region {
             name,
-            file,
+            dir,
             south,
             west,
             north,
@@ -118,10 +106,7 @@ pub fn parse_manifest(body: &str) -> Result<Manifest, String> {
     Ok(Manifest { regions })
 }
 
-/// Tiles covering a disc, in file order.
-///
-/// Sorted by `(x, y)` — the same order the archive index uses — so that
-/// neighbouring tiles come out adjacent and [`coalesce`] can merge them.
+/// Tiles covering a disc.
 pub fn tiles_covering(center: LatLon, radius_m: f64, zoom: u8) -> Vec<TileId> {
     let dlat = radius_m / 111_132.0;
     let dlon = radius_m / (111_320.0 * center.lat.to_radians().cos()).max(1.0);
@@ -146,101 +131,17 @@ pub fn tiles_covering(center: LatLon, radius_m: f64, zoom: u8) -> Vec<TileId> {
     out
 }
 
-/// A contiguous stretch of the archive, covering one or more tiles.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Run {
-    pub start: u64,
-    pub len: u64,
-    pub tiles: Vec<TileSpan>,
-}
-
-impl Run {
-    /// The `Range` header value for this stretch.
-    pub fn range_header(&self) -> String {
-        format!("bytes={}-{}", self.start, self.start + self.len - 1)
-    }
-
-    /// Slices one tile's bytes out of the fetched stretch.
-    pub fn slice<'a>(&self, body: &'a [u8], span: &TileSpan) -> Option<&'a [u8]> {
-        let from = span.offset.checked_sub(self.start)? as usize;
-        body.get(from..from + span.len as usize)
-    }
-}
-
-/// Merges spans into as few range requests as possible.
-///
-/// The archive index is sorted by `(x, y)`, so a block of neighbouring tiles is
-/// already mostly contiguous on disk; the gaps are the tiles of that block we do
-/// not want. Swallowing a small gap costs a few kilobytes, refusing to costs a
-/// whole round trip.
-pub fn coalesce(spans: &[TileSpan], max_gap: u64) -> Vec<Run> {
-    let mut sorted: Vec<TileSpan> = spans.to_vec();
-    sorted.sort_by_key(|s| s.offset);
-
-    let mut runs: Vec<Run> = Vec::new();
-    for span in sorted {
-        let end = span.offset + span.len as u64;
-        match runs.last_mut() {
-            Some(run) if span.offset <= run.start + run.len + max_gap => {
-                run.len = end.saturating_sub(run.start).max(run.len);
-                run.tiles.push(span);
-            }
-            _ => runs.push(Run {
-                start: span.offset,
-                len: span.len as u64,
-                tiles: vec![span],
-            }),
-        }
-    }
-    runs
-}
-
-/// Per-region index, once fetched.
-#[derive(Default)]
-pub struct Indexes {
-    by_file: HashMap<String, Index>,
-}
-
-impl Indexes {
-    pub fn get(&self, file: &str) -> Option<&Index> {
-        self.by_file.get(file)
-    }
-
-    pub fn insert(&mut self, file: String, index: Index) {
-        self.by_file.insert(file, index);
-    }
-
-    /// Spans for the tiles of `tiles` this index actually holds.
-    ///
-    /// Missing tiles are simply absent: the archive does not store empty tiles,
-    /// and rock and ice make up a lot of the Alps.
-    pub fn spans_for(&self, file: &str, tiles: &[TileId]) -> Vec<TileSpan> {
-        let Some(index) = self.by_file.get(file) else {
-            return Vec::new();
-        };
-        tiles.iter().filter_map(|t| index.span(*t)).collect()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Fetching
 // ---------------------------------------------------------------------------
 
-/// How much of the archive to grab when reading an index blind.
-///
-/// The index length depends on the tile count, which is *in* the header — so a
-/// strictly correct reader needs two round trips. One generous first request
-/// avoids that: 64 KB holds 3 276 tiles, where the whole northern Alps needs
-/// 147. The second request stays implemented for the day a region outgrows it.
-const INDEX_PROBE_BYTES: u64 = 64 * 1024;
-
 enum Message {
     Manifest(Result<String, String>),
     Index(String, Result<Vec<u8>, String>),
-    Run(String, Run, Result<(u16, Vec<u8>), String>),
+    Tile(String, TileId, Result<Vec<u8>, String>),
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum Fetch {
     Idle,
     InFlight,
@@ -248,20 +149,21 @@ enum Fetch {
     Failed,
 }
 
-/// Trail data read from static archives.
+/// Trail data read from static tiles.
 ///
 /// Replaces `TrailStore`'s Overpass machinery: no queue, no rate limit, no
-/// endpoint failover, no timeouts. A static file either answers or it does not.
+/// endpoint failover, no timeouts, and no request pacing. These are static files
+/// behind a CDN; holding them back would only make the map slower.
 pub struct TrailArchive {
     base: String,
     manifest: Manifest,
     manifest_state: Fetch,
-    indexes: Indexes,
+    indexes: HashMap<String, Index>,
     index_state: HashMap<String, Fetch>,
-    /// Tiles already inserted into the network.
-    loaded: std::collections::HashSet<(String, TileId)>,
-    in_flight: std::collections::HashSet<(String, TileId)>,
-    inbox: std::sync::Arc<std::sync::Mutex<Vec<Message>>>,
+    /// Tiles already resolved — decoded, empty, or failed for good.
+    settled: HashSet<(String, TileId)>,
+    in_flight: HashSet<(String, TileId)>,
+    inbox: Arc<Mutex<Vec<Message>>>,
     /// Identities for points not shared between ways — see `Way::from_archive`.
     synthetic: i64,
     pub last_error: Option<String>,
@@ -279,20 +181,20 @@ impl TrailArchive {
             base: base.to_owned(),
             manifest: Manifest::default(),
             manifest_state: Fetch::Idle,
-            indexes: Indexes::default(),
+            indexes: HashMap::new(),
             index_state: HashMap::new(),
-            loaded: std::collections::HashSet::new(),
-            in_flight: std::collections::HashSet::new(),
-            inbox: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            settled: HashSet::new(),
+            in_flight: HashSet::new(),
+            inbox: Arc::new(Mutex::new(Vec::new())),
             synthetic: 0,
             last_error: None,
         }
     }
 
-    /// (loaded tiles, tiles in flight, regions known)
+    /// (tiles settled, tiles in flight, regions known)
     pub fn stats(&self) -> (usize, usize, usize) {
         (
-            self.loaded.len(),
+            self.settled.len(),
             self.in_flight.len(),
             self.manifest.regions.len(),
         )
@@ -302,21 +204,33 @@ impl TrailArchive {
         &self.manifest
     }
 
-    /// True once the manifest is here and a region covers this point.
-    pub fn covers(&self, ll: LatLon) -> bool {
-        self.manifest.region_for(ll).is_some()
-    }
-
     pub fn ready(&self) -> bool {
         self.manifest_state == Fetch::Done
     }
 
+    /// True when a region covers this point — the manifest has to be here first.
+    pub fn covers(&self, ll: LatLon) -> bool {
+        self.manifest.region_for(ll).is_some()
+    }
+
+    /// True when everything within `radius_m` of `center` has been resolved.
+    /// Lets a caller wait for a click's ground before snapping it.
+    pub fn area_ready(&self, center: LatLon, radius_m: f64) -> bool {
+        let Some(region) = self.manifest.region_for(center) else {
+            return false;
+        };
+        if self.index_state.get(&region.dir) != Some(&Fetch::Done) {
+            return false;
+        }
+        tiles_covering(center, radius_m, trailfmt::TILE_ZOOM)
+            .into_iter()
+            .all(|t| self.settled.contains(&(region.dir.clone(), t)))
+    }
+
     /// Makes sure the trails within `radius_m` of `center` are on their way.
     ///
-    /// Idempotent and cheap to call every frame: everything already loaded or in
-    /// flight is skipped. Unlike the Overpass version there is no queue and no
-    /// pacing — these are static files behind a CDN, and holding them back would
-    /// only make the map slower.
+    /// Idempotent and cheap to call every frame: anything settled or in flight is
+    /// skipped.
     pub fn ensure_area(&mut self, center: LatLon, radius_m: f64, ctx: &egui::Context) {
         if self.manifest_state == Fetch::Idle {
             self.fetch_manifest(ctx);
@@ -324,38 +238,41 @@ impl TrailArchive {
         let Some(region) = self.manifest.region_for(center) else {
             return;
         };
-        let file = region.file.clone();
+        let dir = region.dir.clone();
 
-        match self.index_state.get(&file) {
+        match self.index_state.get(&dir).copied() {
             None | Some(Fetch::Idle) => {
-                self.fetch_index(&file, 0, INDEX_PROBE_BYTES, ctx);
+                self.fetch_index(&dir, ctx);
                 return;
             }
             Some(Fetch::InFlight) | Some(Fetch::Failed) => return,
             Some(Fetch::Done) => {}
         }
 
-        let tiles: Vec<TileId> = tiles_covering(center, radius_m, trailfmt::TILE_ZOOM)
+        let Some(index) = self.indexes.get(&dir) else {
+            return;
+        };
+        let wanted: Vec<TileId> = tiles_covering(center, radius_m, trailfmt::TILE_ZOOM)
             .into_iter()
             .filter(|t| {
-                let key = (file.clone(), *t);
-                !self.loaded.contains(&key) && !self.in_flight.contains(&key)
+                let key = (dir.clone(), *t);
+                !self.settled.contains(&key) && !self.in_flight.contains(&key)
             })
             .collect();
-        if tiles.is_empty() {
-            return;
-        }
-        let spans = self.indexes.spans_for(&file, &tiles);
-        // Tiles the archive does not hold are empty ground: mark them done so we
-        // stop asking. Rock and ice make up a lot of the Alps.
-        for t in &tiles {
-            self.loaded.insert((file.clone(), *t));
-        }
-        for run in coalesce(&spans, MAX_COALESCE_GAP) {
-            for span in &run.tiles {
-                self.in_flight.insert((file.clone(), span.tile));
+
+        let mut to_fetch = Vec::new();
+        for tile in wanted {
+            if index.has(tile) {
+                to_fetch.push(tile);
+            } else {
+                // Empty ground: the archive holds no tile there. Settling it
+                // stops us asking again, and costs no request at all.
+                self.settled.insert((dir.clone(), tile));
             }
-            self.fetch_run(&file, run, ctx);
+        }
+        for tile in to_fetch {
+            self.in_flight.insert((dir.clone(), tile));
+            self.fetch_tile(&dir, tile, ctx);
         }
     }
 
@@ -383,66 +300,47 @@ impl TrailArchive {
                     self.manifest_state = Fetch::Failed;
                     self.last_error = Some(format!("manifest: {e}"));
                 }
-                Message::Index(file, Ok(bytes)) => match trailfmt::read_index(&bytes) {
+                Message::Index(dir, Ok(bytes)) => match trailfmt::read_index(&bytes) {
                     Ok(index) => {
-                        self.index_state.insert(file.clone(), Fetch::Done);
-                        self.indexes.insert(file, index);
+                        self.index_state.insert(dir.clone(), Fetch::Done);
+                        self.indexes.insert(dir, index);
                     }
                     Err(e) => {
-                        self.index_state.insert(file, Fetch::Failed);
+                        self.index_state.insert(dir, Fetch::Failed);
                         self.last_error = Some(format!("index: {e}"));
                     }
                 },
-                Message::Index(file, Err(e)) => {
-                    self.index_state.insert(file, Fetch::Failed);
+                Message::Index(dir, Err(e)) => {
+                    self.index_state.insert(dir, Fetch::Failed);
                     self.last_error = Some(format!("index: {e}"));
                 }
-                Message::Run(file, run, result) => {
-                    for span in &run.tiles {
-                        self.in_flight.remove(&(file.clone(), span.tile));
-                    }
+                Message::Tile(dir, tile, result) => {
+                    self.in_flight.remove(&(dir.clone(), tile));
                     match result {
-                        Ok((status, body)) => {
-                            // A server that ignores `Range` answers 200 with the
-                            // whole file. Slicing that with run-relative offsets
-                            // would read the wrong bytes and decode plausible
-                            // nonsense, so the base depends on the status.
-                            let base = if status == 206 { run.start } else { 0 };
-                            for span in &run.tiles {
-                                let from = match span.offset.checked_sub(base) {
-                                    Some(v) => v as usize,
-                                    None => continue,
-                                };
-                                let Some(blob) = body.get(from..from + span.len as usize) else {
-                                    self.last_error =
-                                        Some("range response shorter than asked".to_owned());
-                                    continue;
-                                };
-                                match trailfmt::decode_tile(blob) {
-                                    Ok(ways) => {
-                                        for aw in ways {
-                                            if let Some(way) = crate::trails::Way::from_archive(
-                                                aw,
-                                                &mut self.synthetic,
-                                            ) {
-                                                net.insert(way);
-                                                changed = true;
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        self.last_error = Some(format!("tile: {e}"));
+                        Ok(bytes) => match trailfmt::decode_tile(&bytes) {
+                            Ok(ways) => {
+                                for aw in ways {
+                                    if let Some(way) =
+                                        crate::trails::Way::from_archive(aw, &mut self.synthetic)
+                                    {
+                                        net.insert(way);
+                                        changed = true;
                                     }
                                 }
+                                self.settled.insert((dir, tile));
                             }
-                        }
+                            Err(e) => {
+                                // Settled anyway: a tile that does not decode
+                                // will not decode on a retry either, and asking
+                                // forever would hammer the CDN.
+                                self.settled.insert((dir, tile));
+                                self.last_error = Some(format!("tile: {e}"));
+                            }
+                        },
                         Err(e) => {
-                            // Let it be asked for again rather than silently
-                            // leaving a hole in the network.
-                            for span in &run.tiles {
-                                self.loaded.remove(&(file.clone(), span.tile));
-                            }
-                            self.last_error = Some(format!("tiles: {e}"));
+                            // Left unsettled on purpose: a transport failure is
+                            // worth retrying, unlike a decode failure.
+                            self.last_error = Some(format!("tile: {e}"));
                         }
                     }
                 }
@@ -454,7 +352,7 @@ impl TrailArchive {
     fn fetch_manifest(&mut self, ctx: &egui::Context) {
         self.manifest_state = Fetch::InFlight;
         let url = format!("{}{}", self.base, MANIFEST_FILE);
-        let inbox = std::sync::Arc::clone(&self.inbox);
+        let inbox = Arc::clone(&self.inbox);
         let ctx = ctx.clone();
         ehttp::fetch(ehttp::Request::get(url), move |result| {
             let body = match result {
@@ -470,41 +368,40 @@ impl TrailArchive {
         });
     }
 
-    fn fetch_index(&mut self, file: &str, from: u64, to: u64, ctx: &egui::Context) {
-        self.index_state.insert(file.to_owned(), Fetch::InFlight);
-        let url = format!("{}{}", self.base, file);
-        let mut request = ehttp::Request::get(url);
-        request
-            .headers
-            .insert("Range", format!("bytes={from}-{}", to - 1));
-        let inbox = std::sync::Arc::clone(&self.inbox);
+    fn fetch_index(&mut self, dir: &str, ctx: &egui::Context) {
+        self.index_state.insert(dir.to_owned(), Fetch::InFlight);
+        let url = format!("{}{}/{}", self.base, dir, trailfmt::INDEX_FILE);
+        let inbox = Arc::clone(&self.inbox);
         let ctx = ctx.clone();
-        let file = file.to_owned();
-        ehttp::fetch(request, move |result| {
+        let dir = dir.to_owned();
+        ehttp::fetch(ehttp::Request::get(url), move |result| {
             let bytes = match result {
                 Err(e) => Err(e),
                 Ok(r) if !r.ok => Err(format!("HTTP {}", r.status)),
                 Ok(r) => Ok(r.bytes),
             };
-            inbox.lock().unwrap().push(Message::Index(file, bytes));
+            inbox.lock().unwrap().push(Message::Index(dir, bytes));
             ctx.request_repaint();
         });
     }
 
-    fn fetch_run(&mut self, file: &str, run: Run, ctx: &egui::Context) {
-        let url = format!("{}{}", self.base, file);
-        let mut request = ehttp::Request::get(url);
-        request.headers.insert("Range", run.range_header());
-        let inbox = std::sync::Arc::clone(&self.inbox);
+    fn fetch_tile(&mut self, dir: &str, tile: TileId, ctx: &egui::Context) {
+        let url = format!(
+            "{}{}/{}",
+            self.base,
+            dir,
+            trailfmt::tile_path(trailfmt::TILE_ZOOM, tile)
+        );
+        let inbox = Arc::clone(&self.inbox);
         let ctx = ctx.clone();
-        let file = file.to_owned();
-        ehttp::fetch(request, move |result| {
-            let payload = match result {
+        let dir = dir.to_owned();
+        ehttp::fetch(ehttp::Request::get(url), move |result| {
+            let bytes = match result {
                 Err(e) => Err(e),
                 Ok(r) if !r.ok => Err(format!("HTTP {}", r.status)),
-                Ok(r) => Ok((r.status, r.bytes)),
+                Ok(r) => Ok(r.bytes),
             };
-            inbox.lock().unwrap().push(Message::Run(file, run, payload));
+            inbox.lock().unwrap().push(Message::Tile(dir, tile, bytes));
             ctx.request_repaint();
         });
     }
@@ -517,23 +414,15 @@ mod tests {
     const CHAMONIX: LatLon = LatLon::new(45.92, 6.87);
 
     const MANIFEST: &str = r#"{"regions":[
-        {"name":"Alpes du Nord","file":"alps-north.tft",
+        {"name":"Alpes du Nord","dir":"alps",
          "south":43.95,"west":5.35,"north":46.45,"east":7.75}
     ]}"#;
-
-    fn span(x: u32, y: u32, offset: u64, len: u32) -> TileSpan {
-        TileSpan {
-            tile: TileId { x, y },
-            offset,
-            len,
-        }
-    }
 
     #[test]
     fn the_manifest_parses_and_locates() {
         let m = parse_manifest(MANIFEST).unwrap();
         assert_eq!(m.regions.len(), 1);
-        assert_eq!(m.region_for(CHAMONIX).unwrap().file, "alps-north.tft");
+        assert_eq!(m.region_for(CHAMONIX).unwrap().dir, "alps");
         // Outside every region: the deployment simply does not cover it.
         assert!(m.region_for(LatLon::new(48.85, 2.35)).is_none());
     }
@@ -548,16 +437,16 @@ mod tests {
     fn the_manifest_ci_produces_parses() {
         let assembled = concat!(
             r#"{"regions":["#,
-            r#"{"name":"Alpes françaises","file":"alps.tft","south":43.95,"west":5.35,"north":46.45,"east":7.75},"#,
-            r#"{"name":"Pyrénées","file":"pyrenees.tft","south":42.4,"west":-1.8,"north":43.3,"east":3.2}"#,
+            r#"{"name":"Alpes françaises","dir":"alps","south":43.95,"west":5.35,"north":46.45,"east":7.75},"#,
+            r#"{"name":"Pyrénées","dir":"pyrenees","south":42.4,"west":-1.8,"north":43.3,"east":3.2}"#,
             "\n]}"
         );
         let m = parse_manifest(assembled).unwrap();
         assert_eq!(m.regions.len(), 2);
-        assert_eq!(m.region_for(CHAMONIX).unwrap().file, "alps.tft");
+        assert_eq!(m.region_for(CHAMONIX).unwrap().dir, "alps");
         assert_eq!(
-            m.region_for(LatLon::new(42.8, 0.15)).unwrap().file,
-            "pyrenees.tft"
+            m.region_for(LatLon::new(42.8, 0.15)).unwrap().dir,
+            "pyrenees"
         );
     }
 
@@ -570,7 +459,7 @@ mod tests {
         assert!(parse_manifest(r#"{"regions":[]}"#).is_err());
         assert!(parse_manifest(r#"{"nope":1}"#).is_err());
         assert!(parse_manifest(r#"{"regions":[{"name":"x"}]}"#).is_err());
-        let inside_out = r#"{"regions":[{"name":"x","file":"f","south":46.0,
+        let inside_out = r#"{"regions":[{"name":"x","dir":"d","south":46.0,
                              "west":5.0,"north":44.0,"east":7.0}]}"#;
         assert!(
             parse_manifest(inside_out).is_err(),
@@ -578,8 +467,6 @@ mod tests {
         );
     }
 
-    /// The disc must be covered, corners included, and the count must stay in the
-    /// handful-of-tiles range the design assumes.
     #[test]
     fn a_disc_is_covered_by_its_tiles() {
         let tiles = tiles_covering(CHAMONIX, 30_000.0, trailfmt::TILE_ZOOM);
@@ -588,16 +475,11 @@ mod tests {
             "{} tiles for a 30 km radius",
             tiles.len()
         );
-        // The centre and the four cardinal edges of the disc are all inside.
         for (dlat, dlon) in [(0.0, 0.0), (0.26, 0.0), (-0.26, 0.0), (0.0, 0.38), (0.0, -0.38)] {
             let p = LatLon::new(CHAMONIX.lat + dlat, CHAMONIX.lon + dlon);
             let t = trailfmt::tile_of(p.lat, p.lon, trailfmt::TILE_ZOOM);
             assert!(tiles.contains(&t), "{p:?} → {t:?} missing");
         }
-        // Sorted by (x, y): that is what makes coalescing work.
-        let mut sorted = tiles.clone();
-        sorted.sort_by_key(|t| (t.x, t.y));
-        assert_eq!(tiles, sorted);
     }
 
     #[test]
@@ -609,59 +491,8 @@ mod tests {
         assert!(near >= 1);
     }
 
-    /// Adjacent tiles become one request; a real hole stays a separate one.
-    #[test]
-    fn coalescing_turns_a_block_into_a_few_requests() {
-        let spans = vec![
-            span(1, 1, 1000, 500),
-            span(1, 2, 1500, 500), // touching the previous one
-            span(1, 3, 2100, 400), // 100-byte gap: worth swallowing
-            span(9, 9, 5_000_000, 200), // far away: its own request
-        ];
-        let runs = coalesce(&spans, MAX_COALESCE_GAP);
-        assert_eq!(runs.len(), 2, "{runs:#?}");
-        assert_eq!(runs[0].start, 1000);
-        assert_eq!(runs[0].len, 1500, "covers 1000..2500");
-        assert_eq!(runs[0].tiles.len(), 3);
-        assert_eq!(runs[1].tiles.len(), 1);
-        assert_eq!(runs[0].range_header(), "bytes=1000-2499");
-    }
-
-    /// With no merging allowed, every tile is its own request — the behaviour
-    /// coalescing exists to avoid.
-    #[test]
-    fn without_a_gap_budget_every_tile_is_a_request() {
-        let spans = vec![span(1, 1, 0, 10), span(1, 2, 100, 10), span(1, 3, 200, 10)];
-        assert_eq!(coalesce(&spans, 0).len(), 3);
-        assert_eq!(coalesce(&spans, 200).len(), 1);
-    }
-
-    /// Out-of-order spans must not produce a run that runs backwards.
-    #[test]
-    fn coalescing_sorts_before_merging() {
-        let spans = vec![span(2, 0, 900, 100), span(1, 0, 0, 100), span(3, 0, 500, 100)];
-        let runs = coalesce(&spans, MAX_COALESCE_GAP);
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].start, 0);
-        assert_eq!(runs[0].len, 1000);
-    }
-
-    /// Each tile must be recoverable from the bytes of the run that carried it.
-    #[test]
-    fn a_tile_is_sliced_back_out_of_its_run() {
-        let spans = vec![span(1, 1, 10, 4), span(1, 2, 14, 3)];
-        let runs = coalesce(&spans, MAX_COALESCE_GAP);
-        assert_eq!(runs.len(), 1);
-        let body: Vec<u8> = (10u8..=16).collect(); // bytes 10..17 of the archive
-        assert_eq!(runs[0].slice(&body, &spans[0]).unwrap(), &[10, 11, 12, 13]);
-        assert_eq!(runs[0].slice(&body, &spans[1]).unwrap(), &[14, 15, 16]);
-        // A span outside this run must not silently return the wrong bytes.
-        assert_eq!(runs[0].slice(&body, &span(9, 9, 0, 4)), None);
-        assert_eq!(runs[0].slice(&body, &span(9, 9, 20, 4)), None);
-    }
-
     /// Two ways that share one OSM node, in one tile.
-    fn archive_with_a_junction() -> (Vec<u8>, trailfmt::TileSpan) {
+    fn tile_with_a_junction() -> (TileId, Vec<u8>) {
         let shared_node = 1_842_665_301i64;
         let west = trailfmt::ArchiveWay {
             id: 10,
@@ -680,50 +511,44 @@ mod tests {
             shared: vec![Some(shared_node), None],
         };
         let tile = trailfmt::tile_of(45.90, 6.86, trailfmt::TILE_ZOOM);
-        let archive = trailfmt::write_archive(trailfmt::TILE_ZOOM, &[(tile, vec![west, north])]);
-        let span = trailfmt::read_index(&archive).unwrap().span(tile).unwrap();
-        (archive, span)
+        (tile, trailfmt::encode_tile(&[west, north]))
     }
 
-    /// End to end, offline: archive bytes → network → graph. The junction must
-    /// land exactly where the two ways share a node, and nowhere else.
+    /// End to end, offline: tile bytes → network → graph. The junction must land
+    /// exactly where the two ways share a node, and nowhere else.
     ///
     /// ⚠️ This is the test that guards the phantom junction. Points that are not
     /// shared get synthetic identities, and if those ever collided the graph
     /// would weld unrelated trails together with no error at all.
     #[test]
-    fn a_run_becomes_a_network_with_exactly_one_junction() {
-        let (archive, span) = archive_with_a_junction();
-        let run = coalesce(&[span], MAX_COALESCE_GAP).into_iter().next().unwrap();
-        let body = archive[run.start as usize..][..run.len as usize].to_vec();
-
+    fn a_tile_becomes_a_network_with_exactly_one_junction() {
+        let (tile, blob) = tile_with_a_junction();
         let mut store = TrailArchive::new("unused/");
         store
             .inbox
             .lock()
             .unwrap()
-            .push(Message::Run("f".to_owned(), run, Ok((206, body))));
+            .push(Message::Tile("alps".to_owned(), tile, Ok(blob)));
 
         let mut net = crate::trails::TrailNetwork::default();
         assert!(store.pump(&mut net), "the network must gain ways");
         assert_eq!(net.len(), 2);
+        assert!(store.settled.contains(&("alps".to_owned(), tile)));
 
-        // Four points, of which two are the same shared node.
         let ids: Vec<i64> = net.ways().iter().flat_map(|w| w.nodes.clone()).collect();
-        let distinct: std::collections::HashSet<i64> = ids.iter().copied().collect();
+        let distinct: HashSet<i64> = ids.iter().copied().collect();
         assert_eq!(ids.len(), 4);
         assert_eq!(distinct.len(), 3, "exactly one identity is shared: {ids:?}");
-        assert!(
-            ids.iter().filter(|i| **i > 0).count() == 2,
+        assert_eq!(
+            ids.iter().filter(|i| **i > 0).count(),
+            2,
             "only the shared node keeps a real OSM id: {ids:?}"
         );
 
-        // The graph agrees: three nodes, two edges, meeting at one junction.
         let graph = crate::graph::Graph::build(&net);
         assert_eq!(graph.node_count(), 3);
         assert_eq!(graph.edges.len(), 2);
 
-        // Metadata survived the round trip.
         let west = net.way_by_id(10).unwrap();
         assert_eq!(west.kind, crate::trails::WayKind::Path);
         assert_eq!(west.name.as_deref(), Some("Sentier ouest"));
@@ -731,63 +556,138 @@ mod tests {
         assert!((west.points[0].lat - 45.900).abs() < 1e-5);
     }
 
-    /// A server that ignores `Range` answers 200 with the whole file. Slicing
-    /// that with run-relative offsets would decode plausible nonsense, so the
-    /// reader must key off the status code.
+    /// A transport failure is worth retrying; a decode failure is not. Confusing
+    /// the two either leaves a permanent hole in the network or hammers the CDN
+    /// forever.
     #[test]
-    fn a_server_ignoring_range_still_works() {
-        let (archive, span) = archive_with_a_junction();
-        let run = coalesce(&[span], MAX_COALESCE_GAP).into_iter().next().unwrap();
-        assert!(run.start > 0, "the tile must not sit at offset zero");
-
-        let mut store = TrailArchive::new("unused/");
-        store.inbox.lock().unwrap().push(Message::Run(
-            "f".to_owned(),
-            run,
-            Ok((200, archive.clone())),
-        ));
+    fn only_transport_failures_are_retried() {
+        let (tile, _) = tile_with_a_junction();
         let mut net = crate::trails::TrailNetwork::default();
-        assert!(store.pump(&mut net));
-        assert_eq!(net.len(), 2, "the whole-file answer must decode the same");
-        assert!(store.last_error.is_none(), "{:?}", store.last_error);
-    }
 
-    /// A failed run must be forgotten, not remembered as loaded — otherwise the
-    /// network keeps a hole nothing will ever fill.
-    #[test]
-    fn a_failed_run_can_be_asked_for_again() {
-        let (_, span) = archive_with_a_junction();
-        let run = coalesce(&[span], MAX_COALESCE_GAP).into_iter().next().unwrap();
         let mut store = TrailArchive::new("unused/");
-        let key = ("f".to_owned(), span.tile);
-        store.loaded.insert(key.clone());
-        store.in_flight.insert(key.clone());
-        store.inbox.lock().unwrap().push(Message::Run(
-            "f".to_owned(),
-            run,
+        store.in_flight.insert(("alps".to_owned(), tile));
+        store.inbox.lock().unwrap().push(Message::Tile(
+            "alps".to_owned(),
+            tile,
             Err("network down".to_owned()),
         ));
-
-        let mut net = crate::trails::TrailNetwork::default();
         assert!(!store.pump(&mut net));
-        assert!(!store.loaded.contains(&key), "a failed tile must be retried");
-        assert!(!store.in_flight.contains(&key));
+        assert!(!store.settled.contains(&("alps".to_owned(), tile)));
+        assert!(!store.in_flight.contains(&("alps".to_owned(), tile)));
+
+        let mut store = TrailArchive::new("unused/");
+        store.inbox.lock().unwrap().push(Message::Tile(
+            "alps".to_owned(),
+            tile,
+            Ok(b"<!DOCTYPE html>".to_vec()),
+        ));
+        assert!(!store.pump(&mut net));
+        assert!(
+            store.settled.contains(&("alps".to_owned(), tile)),
+            "a tile that cannot decode will not decode on a retry either"
+        );
         assert!(store.last_error.is_some());
     }
 
+    /// Ground the archive does not cover costs no request at all — the Alps are
+    /// largely rock and ice, and the index is what makes that free.
     #[test]
-    fn missing_tiles_are_skipped_not_invented() {
-        let mut indexes = Indexes::default();
-        indexes.insert(
-            "f".to_owned(),
+    fn empty_ground_is_settled_without_a_request() {
+        let ctx = egui::Context::default();
+        let mut store = TrailArchive::new("unused/");
+        store.manifest = parse_manifest(MANIFEST).unwrap();
+        store.manifest_state = Fetch::Done;
+        store.index_state.insert("alps".to_owned(), Fetch::Done);
+        // An index that holds nothing at all.
+        store.indexes.insert(
+            "alps".to_owned(),
             Index {
                 zoom: trailfmt::TILE_ZOOM,
-                spans: vec![span(1, 1, 0, 10)],
+                tiles: Vec::new(),
             },
         );
-        let wanted = vec![TileId { x: 1, y: 1 }, TileId { x: 7, y: 7 }];
-        let got = indexes.spans_for("f", &wanted);
-        assert_eq!(got.len(), 1, "an absent tile is absent, not empty bytes");
-        assert!(indexes.spans_for("unknown", &wanted).is_empty());
+
+        store.ensure_area(CHAMONIX, 30_000.0, &ctx);
+        let (settled, in_flight, _) = store.stats();
+        assert!(settled > 0, "the empty tiles must be settled");
+        assert_eq!(in_flight, 0, "and none of them requested");
+
+        // Asking again changes nothing.
+        store.ensure_area(CHAMONIX, 30_000.0, &ctx);
+        assert_eq!(store.stats(), (settled, 0, 1));
+        assert!(store.area_ready(CHAMONIX, 30_000.0));
+    }
+
+    /// The whole chain against the **deployed** tiles: manifest → index → tile →
+    /// decode → network → snap → graph.
+    ///
+    /// `cargo test --release -- --ignored deployed --nocapture`
+    ///
+    /// ⚠️ This is the only test that exercises the real CDN, the data CI
+    /// produced and the reader together. It caught the range-versus-gzip
+    /// incompatibility that curl and Python had both missed.
+    #[test]
+    #[ignore = "network"]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn the_deployed_tiles_are_readable() {
+        const BASE: &str = "https://lemuffinman.github.io/TrackFinder/trails/";
+
+        fn get(url: &str) -> Vec<u8> {
+            let r = ehttp::fetch_blocking(&ehttp::Request::get(url))
+                .unwrap_or_else(|e| panic!("{url}: {e}"));
+            assert!(r.ok, "{url}: HTTP {}", r.status);
+            r.bytes
+        }
+
+        let manifest = parse_manifest(
+            std::str::from_utf8(&get(&format!("{BASE}{MANIFEST_FILE}"))).expect("utf-8"),
+        )
+        .expect("manifest");
+        let region = manifest
+            .region_for(CHAMONIX)
+            .expect("the Alps must be published");
+
+        let index = trailfmt::read_index(&get(&format!(
+            "{BASE}{}/{}",
+            region.dir,
+            trailfmt::INDEX_FILE
+        )))
+        .expect("index");
+        assert_eq!(index.zoom, trailfmt::TILE_ZOOM);
+        assert!(index.tiles.len() > 100, "{} tiles", index.tiles.len());
+
+        let tile = trailfmt::tile_of(CHAMONIX.lat, CHAMONIX.lon, trailfmt::TILE_ZOOM);
+        assert!(index.has(tile), "Chamonix must be in the index");
+        let blob = get(&format!(
+            "{BASE}{}/{}",
+            region.dir,
+            trailfmt::tile_path(trailfmt::TILE_ZOOM, tile)
+        ));
+
+        let mut store = TrailArchive::new(BASE);
+        store
+            .inbox
+            .lock()
+            .unwrap()
+            .push(Message::Tile(region.dir.clone(), tile, Ok(blob.clone())));
+        let mut net = crate::trails::TrailNetwork::default();
+        assert!(store.pump(&mut net));
+        assert!(net.len() > 200, "{} ways in the Chamonix tile", net.len());
+        assert!(store.last_error.is_none(), "{:?}", store.last_error);
+
+        let snap = net
+            .snap(LatLon::new(45.9237, 6.8703), crate::trails::SNAP_RADIUS_M)
+            .expect("no trail near the centre of Chamonix");
+        assert!(snap.dist_m <= crate::trails::SNAP_RADIUS_M);
+
+        let graph = crate::graph::Graph::build(&net);
+        assert!(!graph.is_empty());
+        eprintln!(
+            "Chamonix tile: {} KB, {} ways, {} graph nodes, {} edges",
+            blob.len() / 1024,
+            net.len(),
+            graph.node_count(),
+            graph.edges.len()
+        );
     }
 }

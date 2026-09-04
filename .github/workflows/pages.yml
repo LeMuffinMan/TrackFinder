@@ -101,11 +101,12 @@ jobs:
           # both files are counted together.
           cargo run --release --locked -p trailprep -- \
             --name "Alpes françaises" \
-            --out data/trails/alps.tft \
+            --out data/trails/alps \
             --bbox "$ALPS_BBOX" \
             data/extracts/*.osm.pbf
           rm -rf data/extracts
-          ls -la data/trails
+          echo "$(find data/trails -name '*.tft' | wc -l) tiles"
+          du -sh data/trails
 
       # The site is served from /TrackFinder/: without --public-url the HTML
       # would look for the .wasm at the domain root and show nothing.
@@ -115,21 +116,25 @@ jobs:
       # After `trunk build`, which wipes dist. The manifest is assembled from the
       # fragments each preprocessor run writes, so a bounding box is never
       # repeated by hand and can never drift from what was actually built.
-      - name: Publish trail archives
+      - name: Publish trail tiles
         run: |
           set -euo pipefail
           mkdir -p dist/trails
-          cp data/trails/*.tft dist/trails/
+          # One directory per region, each holding its index and its tiles.
+          for region in data/trails/*/; do
+            cp -r "$region" dist/trails/
+          done
           {
             printf '{"regions":['
             # `cat | paste -sd,` and not `paste -sd, files...`: the latter
             # serialises each file onto its own line instead of joining across
             # them, which is valid JSON only as long as there is exactly one
             # region — it would break the day a second massif is added.
-            cat data/trails/*.tft.json | paste -sd,
+            cat data/trails/*.json | paste -sd,
             printf ']}'
           } > dist/trails/regions.json
           cat dist/trails/regions.json
+          echo "$(find dist/trails -name '*.tft' | wc -l) tiles published"
           du -sh dist/trails
 
       - uses: actions/configure-pages@v5

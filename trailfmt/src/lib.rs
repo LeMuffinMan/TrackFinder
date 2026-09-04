@@ -10,18 +10,35 @@
 //! connections that day. This format exists to replace that with static bytes on
 //! a CDN.
 //!
-//! ## Layout
+//! ## Layout: one file per tile, and why
+//!
+//! ⚠️ **Range requests over a single archive were tried and abandoned.** They
+//! work — GitHub Pages answers `206` with `accept-ranges: bytes` — right up
+//! until the client sends `Accept-Encoding: gzip`, which **every browser does
+//! and none lets you disable** (`Accept-Encoding` is a forbidden header name).
+//! Pages then compresses the file and applies the range to the *compressed*
+//! stream:
 //!
 //! ```text
-//! header  MAGIC(8) | u8 zoom | u8 version | u16 pad | u32 tile_count
-//! index   tile_count × { u32 x, u32 y, u64 offset, u32 len }   (sorted by x,y)
-//! blobs   one per tile, at its own offset
+//! Range without gzip : content-range: bytes 0-99/43207895 → "TFTRAIL1"
+//! Range with gzip    : content-range: bytes 0-99/35745895 → 1f 8b 08 00 …
 //! ```
 //!
-//! The index is small enough to fetch whole (a few kilobytes for the whole
-//! Alps), after which every tile is one HTTP range request against a single
-//! static file. GitHub Pages answers those with `206` and `accept-ranges: bytes`
-//! — verified on the live site before this format was designed.
+//! Offsets into the uncompressed file are meaningless against a compressed one,
+//! so the reader gets a fragment of a gzip stream it cannot inflate. Measured
+//! 2026-09-04; curl and Python had both given a false green because neither asks
+//! for gzip by default.
+//!
+//! One file per tile sidesteps it entirely, and is better besides: gzip applies
+//! (−17 % measured), every tile carries its own ETag so a revisit costs a `304`
+//! rather than a download, and HTTP/2 multiplexes the parallel fetches. The
+//! whole French Alps is 228 tiles.
+//!
+//! ```text
+//! trails/regions.json          the manifest, listing regions
+//! trails/alps/index.tfi        which tiles exist (a couple of kilobytes)
+//! trails/alps/11/1063/729.tft  one tile
+//! ```
 //!
 //! ## Encoding choices
 //!
@@ -39,7 +56,8 @@
 
 #![forbid(unsafe_code)]
 
-pub const MAGIC: &[u8; 8] = b"TFTRAIL1";
+/// Magic at the head of every tile blob.
+pub const TILE_MAGIC: &[u8; 4] = b"TFT1";
 pub const VERSION: u8 = 1;
 
 /// Coordinate quantum, in degrees. 1e-6° is ~11 cm of latitude.
@@ -273,9 +291,6 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4 bytes")))
     }
 
-    fn u64le(&mut self) -> Result<u64, FormatError> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("8 bytes")))
-    }
 }
 
 fn quantise(deg: f64) -> i64 {
@@ -295,6 +310,11 @@ fn dequantise(q: i64) -> f64 {
 pub fn encode_tile(ways: &[ArchiveWay]) -> Vec<u8> {
     let usable: Vec<&ArchiveWay> = ways.iter().filter(|w| w.is_valid()).collect();
     let mut out = Vec::new();
+    // Five bytes of identity per tile. A 404 from the CDN is an HTML page, and
+    // decoding that as geometry would fail somewhere deep with a confusing
+    // message instead of saying plainly that this is not a tile.
+    out.extend_from_slice(TILE_MAGIC);
+    out.push(VERSION);
     put_uvarint(&mut out, usable.len() as u64);
 
     let mut prev_id = 0i64;
@@ -343,6 +363,13 @@ pub fn encode_tile(ways: &[ArchiveWay]) -> Vec<u8> {
 /// Decodes one tile blob.
 pub fn decode_tile(bytes: &[u8]) -> Result<Vec<ArchiveWay>, FormatError> {
     let mut r = Reader::new(bytes);
+    if r.take(4)? != TILE_MAGIC {
+        return Err(FormatError::BadMagic);
+    }
+    let version = r.u8()?;
+    if version != VERSION {
+        return Err(FormatError::BadVersion(version));
+    }
     let count = r.uvarint()? as usize;
     // Not `with_capacity(count)`: a corrupt length would otherwise reserve
     // gigabytes before the first read fails.
@@ -407,76 +434,54 @@ pub fn decode_tile(bytes: &[u8]) -> Result<Vec<ArchiveWay>, FormatError> {
 // Archive
 // ---------------------------------------------------------------------------
 
-pub const HEADER_LEN: usize = 8 + 1 + 1 + 2 + 4;
-pub const INDEX_ENTRY_LEN: usize = 4 + 4 + 8 + 4;
+/// Index magic. Distinct from a tile's, so mixing the two files up is an error
+/// rather than a confusing decode failure.
+pub const INDEX_MAGIC: &[u8; 8] = b"TFIDX001";
 
-/// Where one tile's bytes live inside the archive.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TileSpan {
-    pub tile: TileId,
-    pub offset: u64,
-    pub len: u32,
-}
+/// Name of the index inside a region's directory.
+pub const INDEX_FILE: &str = "index.tfi";
 
-/// Everything needed to turn a tile request into a byte range.
+/// Which tiles a region actually holds.
+///
+/// Only the ids: with one file per tile there are no offsets to carry. Empty
+/// tiles are never published — the Alps are largely rock and ice — and this is
+/// what lets the reader skip them instead of collecting 404s.
 #[derive(Clone, Debug, Default)]
 pub struct Index {
     pub zoom: u8,
-    pub spans: Vec<TileSpan>,
+    /// Sorted, so lookups bisect.
+    pub tiles: Vec<TileId>,
 }
 
 impl Index {
-    pub fn span(&self, tile: TileId) -> Option<TileSpan> {
-        self.spans
-            .binary_search_by_key(&(tile.x, tile.y), |s| (s.tile.x, s.tile.y))
-            .ok()
-            .map(|i| self.spans[i])
-    }
-
-    /// Bytes to fetch to hold the whole index, known before reading anything.
-    pub fn header_and_index_len(tile_count: usize) -> usize {
-        HEADER_LEN + tile_count * INDEX_ENTRY_LEN
+    pub fn has(&self, tile: TileId) -> bool {
+        self.tiles
+            .binary_search_by_key(&(tile.x, tile.y), |t| (t.x, t.y))
+            .is_ok()
     }
 }
 
-/// Builds a complete archive. `tiles` need not be sorted.
-pub fn write_archive(zoom: u8, tiles: &[(TileId, Vec<ArchiveWay>)]) -> Vec<u8> {
-    let mut blobs: Vec<(TileId, Vec<u8>)> = tiles
-        .iter()
-        .map(|(t, ways)| (*t, encode_tile(ways)))
-        .filter(|(_, b)| !b.is_empty() && b != &[0u8])
-        .collect();
-    // Sorted so the index can be searched by bisection, and so neighbouring
-    // tiles land next to each other — a block of tiles is then one contiguous
-    // range rather than a scattering of them.
-    blobs.sort_by_key(|(t, _)| (t.x, t.y));
+pub fn write_index(zoom: u8, tiles: &[TileId]) -> Vec<u8> {
+    let mut sorted: Vec<TileId> = tiles.to_vec();
+    sorted.sort_by_key(|t| (t.x, t.y));
+    sorted.dedup();
 
-    let mut out = Vec::new();
-    out.extend_from_slice(MAGIC);
+    let mut out = Vec::with_capacity(16 + sorted.len() * 8);
+    out.extend_from_slice(INDEX_MAGIC);
     out.push(zoom);
     out.push(VERSION);
     out.extend_from_slice(&[0u8; 2]);
-    out.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
-
-    let mut offset = Index::header_and_index_len(blobs.len()) as u64;
-    for (tile, blob) in &blobs {
-        out.extend_from_slice(&tile.x.to_le_bytes());
-        out.extend_from_slice(&tile.y.to_le_bytes());
-        out.extend_from_slice(&offset.to_le_bytes());
-        out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
-        offset += blob.len() as u64;
-    }
-    for (_, blob) in &blobs {
-        out.extend_from_slice(blob);
+    out.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
+    for t in &sorted {
+        out.extend_from_slice(&t.x.to_le_bytes());
+        out.extend_from_slice(&t.y.to_le_bytes());
     }
     out
 }
 
-/// Reads the header and index. `bytes` may be just the first kilobytes of the
-/// archive — that is the point of keeping the index at the front.
 pub fn read_index(bytes: &[u8]) -> Result<Index, FormatError> {
     let mut r = Reader::new(bytes);
-    if r.take(8)? != MAGIC {
+    if r.take(8)? != INDEX_MAGIC {
         return Err(FormatError::BadMagic);
     }
     let zoom = r.u8()?;
@@ -486,20 +491,20 @@ pub fn read_index(bytes: &[u8]) -> Result<Index, FormatError> {
     }
     r.take(2)?;
     let count = r.u32le()? as usize;
-
-    let mut spans = Vec::new();
+    let mut tiles = Vec::new();
     for _ in 0..count {
         let x = r.u32le()?;
         let y = r.u32le()?;
-        let offset = r.u64le()?;
-        let len = r.u32le()?;
-        spans.push(TileSpan {
-            tile: TileId { x, y },
-            offset,
-            len,
-        });
+        tiles.push(TileId { x, y });
     }
-    Ok(Index { zoom, spans })
+    Ok(Index { zoom, tiles })
+}
+
+/// Path of one tile inside a region's directory, `<z>/<x>/<y>.tft`.
+///
+/// The conventional tile layout, so the URL is derived rather than looked up.
+pub fn tile_path(zoom: u8, tile: TileId) -> String {
+    format!("{zoom}/{}/{}.tft", tile.x, tile.y)
 }
 
 #[cfg(test)]
@@ -610,69 +615,75 @@ mod tests {
     }
 
     #[test]
-    fn the_archive_index_bisects() {
-        let tiles: Vec<(TileId, Vec<ArchiveWay>)> = [(5u32, 9u32), (1, 2), (5, 1)]
-            .into_iter()
-            .map(|(x, y)| (TileId { x, y }, vec![sample()]))
-            .collect();
-        let archive = write_archive(11, &tiles);
-        let index = read_index(&archive).unwrap();
-
+    fn the_index_lists_and_bisects() {
+        let tiles = vec![
+            TileId { x: 5, y: 9 },
+            TileId { x: 1, y: 2 },
+            TileId { x: 5, y: 1 },
+            TileId { x: 1, y: 2 }, // duplicate
+        ];
+        let index = read_index(&write_index(11, &tiles)).unwrap();
         assert_eq!(index.zoom, 11);
-        assert_eq!(index.spans.len(), 3);
-        // Sorted, so neighbouring tiles are adjacent in the file.
-        let keys: Vec<(u32, u32)> = index.spans.iter().map(|s| (s.tile.x, s.tile.y)).collect();
-        assert_eq!(keys, vec![(1, 2), (5, 1), (5, 9)]);
-
-        for (tile, _) in &tiles {
-            let span = index.span(*tile).expect("every tile is findable");
-            let blob = &archive[span.offset as usize..][..span.len as usize];
-            assert_eq!(decode_tile(blob).unwrap()[0].id, sample().id);
+        let keys: Vec<(u32, u32)> = index.tiles.iter().map(|t| (t.x, t.y)).collect();
+        assert_eq!(keys, vec![(1, 2), (5, 1), (5, 9)], "sorted and deduplicated");
+        for t in &index.tiles {
+            assert!(index.has(*t));
         }
-        assert_eq!(index.span(TileId { x: 42, y: 42 }), None);
+        assert!(!index.has(TileId { x: 42, y: 42 }));
     }
 
-    /// The index can be read from a prefix of the file: that is what makes one
-    /// range request per tile possible.
+    /// The index for the whole French Alps must stay small enough to fetch in
+    /// one go — that is what replaces the byte-offset table.
     #[test]
-    fn the_index_is_readable_from_a_prefix() {
-        let tiles = vec![(TileId { x: 1, y: 1 }, vec![sample()])];
-        let archive = write_archive(11, &tiles);
-        let prefix_len = Index::header_and_index_len(1);
-        let index = read_index(&archive[..prefix_len]).unwrap();
-        assert_eq!(index.spans.len(), 1);
-        assert!(prefix_len < archive.len(), "the prefix is not the whole file");
+    fn the_index_stays_tiny() {
+        let tiles: Vec<TileId> = (0..228).map(|i| TileId { x: 1000 + i, y: 700 }).collect();
+        let bytes = write_index(TILE_ZOOM, &tiles).len();
+        assert!(bytes < 4096, "{bytes} bytes for 228 tiles");
+    }
+
+    /// The tile URL is derived from its coordinates, never looked up.
+    #[test]
+    fn a_tile_has_a_conventional_path() {
+        assert_eq!(tile_path(11, TileId { x: 1063, y: 729 }), "11/1063/729.tft");
+    }
+
+    /// A tile and an index must never be mistaken for one another, nor either
+    /// for the HTML a CDN serves on a 404.
+    #[test]
+    fn the_two_files_are_told_apart() {
+        let tile = encode_tile(&[sample()]);
+        let index = write_index(11, &[TileId { x: 1, y: 1 }]);
+        assert_eq!(read_index(&tile).unwrap_err(), FormatError::BadMagic);
+        assert_eq!(decode_tile(&index).unwrap_err(), FormatError::BadMagic);
+        let not_found = b"<!DOCTYPE html><html><title>404</title></html>";
+        assert_eq!(decode_tile(not_found).unwrap_err(), FormatError::BadMagic);
+        assert_eq!(read_index(not_found).unwrap_err(), FormatError::BadMagic);
     }
 
     #[test]
     fn a_foreign_file_is_refused() {
         assert_eq!(
-            read_index(b"not an archive at all").unwrap_err(),
+            read_index(b"not an index at all").unwrap_err(),
             FormatError::BadMagic
         );
-        assert_eq!(read_index(b"TFTRAIL1").unwrap_err(), FormatError::Truncated);
-        let mut archive = write_archive(11, &[(TileId { x: 0, y: 0 }, vec![sample()])]);
-        archive[9] = 99;
-        assert_eq!(
-            read_index(&archive).unwrap_err(),
-            FormatError::BadVersion(99)
-        );
+        assert_eq!(read_index(INDEX_MAGIC).unwrap_err(), FormatError::Truncated);
+        let mut index = write_index(11, &[TileId { x: 0, y: 0 }]);
+        index[9] = 99;
+        assert_eq!(read_index(&index).unwrap_err(), FormatError::BadVersion(99));
+        let mut tile = encode_tile(&[sample()]);
+        tile[4] = 99;
+        assert_eq!(decode_tile(&tile).unwrap_err(), FormatError::BadVersion(99));
     }
 
-    /// Empty tiles are not written at all: the Alps are mostly rock and ice, and
-    /// an index entry per empty tile would be pure overhead.
+    /// An empty tile encodes to a header and nothing else — the preprocessor
+    /// uses that to decide not to publish it at all. The Alps are mostly rock
+    /// and ice, and a file per empty tile would be pure overhead.
     #[test]
-    fn empty_tiles_are_dropped() {
-        let archive = write_archive(
-            11,
-            &[
-                (TileId { x: 0, y: 0 }, vec![]),
-                (TileId { x: 1, y: 0 }, vec![sample()]),
-            ],
-        );
-        let index = read_index(&archive).unwrap();
-        assert_eq!(index.spans.len(), 1);
-        assert_eq!(index.spans[0].tile, TileId { x: 1, y: 0 });
+    fn an_empty_tile_is_recognisable() {
+        let empty = encode_tile(&[]);
+        assert_eq!(empty.len(), 6, "magic, version, and a zero count");
+        assert!(decode_tile(&empty).unwrap().is_empty());
+        assert!(encode_tile(&[sample()]).len() > empty.len());
     }
 
     /// Two archives built independently must never claim the same identity for
