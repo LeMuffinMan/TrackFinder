@@ -4,6 +4,7 @@ mod dem;
 mod geo;
 mod graph;
 mod map;
+mod supply;
 mod terrain;
 mod tiles;
 mod track;

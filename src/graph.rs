@@ -11,7 +11,7 @@ use std::collections::{BinaryHeap, HashMap};
 use crate::dem::GRAPH_DEM_ZOOM;
 use crate::dem::DemStore;
 use crate::geo::{haversine_m, LatLon};
-use crate::track::WalkSettings;
+use crate::track::{SpeedModel, WalkSettings};
 use crate::trails::{Snap, TrailNetwork};
 
 /// Cost in milliseconds: an integer, so it orders cleanly with no floating
@@ -33,15 +33,34 @@ pub struct Edge {
 impl Edge {
     /// Travel time in the given direction, in milliseconds.
     pub fn cost_ms(&self, forward: bool, w: &WalkSettings) -> CostMs {
-        let (up, _down) = match self.climb {
+        let (up, down) = match self.climb {
             Some((up, down)) if forward => (up as f64, down as f64),
             Some((up, down)) => (down as f64, up as f64),
             None => (0.0, 0.0),
         };
         let factor = w.speed_factor().max(0.1);
-        let hours = ((self.len_m / 1000.0) / w.flat_kmh.max(0.1) + up / w.ascent_mh.max(1.0))
-            / factor;
-        (hours * 3_600_000.0) as CostMs
+        let base_h = match w.model {
+            SpeedModel::Naismith => {
+                (self.len_m / 1000.0) / w.flat_kmh.max(0.1) + up / w.ascent_mh.max(1.0)
+            }
+            // An edge only knows its climb and its drop, not where they sit
+            // along it. Split it into an up part and a down part in proportion,
+            // both at the same slope magnitude — the coarsest reading of Tobler
+            // that still slows a steep edge down in both directions.
+            SpeedModel::Tobler => {
+                let total = up + down;
+                if total <= 0.0 || self.len_m <= 0.0 {
+                    (self.len_m / 1000.0) / w.slope_kmh(0.0)
+                } else {
+                    let slope = total / self.len_m;
+                    let up_len = self.len_m * up / total;
+                    let down_len = self.len_m - up_len;
+                    (up_len / 1000.0) / w.slope_kmh(slope)
+                        + (down_len / 1000.0) / w.slope_kmh(-slope)
+                }
+            }
+        };
+        (base_h / factor * 3_600_000.0) as CostMs
     }
 }
 
@@ -498,7 +517,7 @@ mod tests {
     #[test]
     fn cost_depends_on_direction() {
         let w = WalkSettings {
-            pack_weight_kg: 0.0,
+            load_kg: 0.0,
             ..Default::default()
         };
         let edge = Edge {
@@ -526,7 +545,7 @@ mod tests {
         }
         let w = WalkSettings {
             flat_kmh: 5.0,
-            pack_weight_kg: 0.0,
+            load_kg: 0.0,
             ..Default::default()
         };
         // From the westernmost node (OSM node 1).

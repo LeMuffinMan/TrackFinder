@@ -8,11 +8,17 @@ use crate::graph::{self, CostMs, EdgePos, Graph, Reach};
 use crate::map::{self, MapView, TileRenderer, MAX_TILE_REQUESTS};
 use crate::terrain::{self, TerrainAnalysis};
 use crate::tiles::{HttpTileSource, RasterLayer, TileSource};
-use crate::track::{format_duration, Track, WalkSettings, Waypoint};
+use crate::supply::{self, Plan, Resupply, SupplySettings};
+use crate::track::{format_duration, SpeedModel, Track, WalkSettings, Waypoint};
 use crate::archive::TrailArchive;
 use crate::trails::{Snap, TrailNetwork, SNAP_RADIUS_M};
 
-/// The French Alps, from Lake Geneva down to the Mercantour.
+/// The western Alps, from Lake Geneva down to the Mercantour.
+///
+/// ⚠️ The box crosses into Italy and Switzerland, and that is deliberate: a
+/// French route uses the far side of the frontier constantly — the Vallée
+/// Étroite, the Tour du Mont-Blanc, the Queyras ridges. The extracts feeding
+/// `trailprep` must cover the box, borders included.
 ///
 /// The application opens on the whole range rather than on one valley: you pick
 /// the massif first, then zoom in. Deliberately below `TRAILS_MIN_ZOOM`, so
@@ -39,7 +45,7 @@ const LEG_RADIUS_M: f64 = 30_000.0;
 ///
 /// Smaller: at this stage the network is only a cue for where one may usefully
 /// click, not the ground a leg will be planned on.
-const VIEW_RADIUS_M: f64 = 8_000.0;
+pub(crate) const VIEW_RADIUS_M: f64 = 8_000.0;
 
 /// Trails a click needs before it can snap.
 ///
@@ -61,15 +67,27 @@ const CLICK_RADIUS_M: f64 = 500.0;
 ///   so changing the slider refetches, and routing would have to keep the full
 ///   geometry anyway — the saving evaporates.
 ///
-/// What is left is what the eye actually needs: fewer classes, and a coarser
-/// screen-space decimation. Both act at the current zoom, both are instant.
+/// What is left is a screen-space decimation, applied at the current zoom.
+///
+/// ⚠️ **The default never hides a way that can be routed on.** It used to: the
+/// class filter dropped `Road`, which is 23 % of a Chamonix tile, while the
+/// graph, the snap and the isochrone kept using those ways. You could click a
+/// trail you could not see, and `paint_isochrone` — which has no notion of
+/// detail — coloured reachable stretches over blank ground. Making the
+/// isochrone obey the filter instead would have been worse: a reachable stretch
+/// that disappears reads as "you cannot get there", the same failure mode as
+/// missing data. So the classes are all drawn, and only their fidelity varies.
+///
+/// `Sparse` still drops classes, and that is fine: it is an escape hatch the
+/// user opts into on a slow machine, not the state they land in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Detail {
-    /// Hiking ways only, heavily decimated: the shape of the network.
+    /// Hiking ways only, heavily decimated: the shape of the network. The one
+    /// level that hides routable ways, and only because it was asked for.
     Sparse,
-    /// Everything off-tarmac.
+    /// Everything, with roads coarse and dim.
     Normal,
-    /// Roads and streets included, near-full geometry.
+    /// Everything, near-full geometry, roads as sharp as the rest.
     Full,
 }
 
@@ -77,25 +95,33 @@ impl Detail {
     fn label(self) -> &'static str {
         match self {
             Self::Sparse => "Paths only",
-            Self::Normal => "Off-road",
-            Self::Full => "Everything",
+            Self::Normal => "Balanced",
+            Self::Full => "Sharp",
         }
     }
 
     fn hint(self) -> &'static str {
         match self {
-            Self::Sparse => "hiking ways, simplified — the shape of the network",
-            Self::Normal => "adds tracks and cycleways",
-            Self::Full => "adds roads and streets, near-full geometry",
+            Self::Sparse => "hiking ways only — faster, and it hides ways you can still route on",
+            Self::Normal => "the whole network, roads drawn coarse and dim",
+            Self::Full => "the whole network at near-full geometry",
         }
     }
 
     fn draws(self, kind: crate::trails::WayKind) -> bool {
         match self {
             Self::Sparse => kind.is_hiking(),
-            Self::Normal => kind.is_offroad(),
-            Self::Full => true,
+            Self::Normal | Self::Full => {
+                let _ = kind;
+                true
+            }
         }
+    }
+
+    /// True when the level leaves out ways the graph would still route on — the
+    /// panel says so rather than letting the map look authoritative.
+    fn hides_routable(self) -> bool {
+        matches!(self, Self::Sparse)
     }
 
     /// Squared screen distance below which a shape point is dropped.
@@ -109,6 +135,21 @@ impl Detail {
             Self::Sparse => 36.0,
             Self::Normal => 9.0,
             Self::Full => 2.25,
+        }
+    }
+
+    /// Threshold for a given class. Roads carry far more geometry than a path
+    /// and none of it is worth reading: a valley road only has to be *there*.
+    /// With this split, drawing every class costs nothing measurable against
+    /// hiding the roads outright — 1.4–1.5 ms of median frame either way on
+    /// `frame_cost`. Drawn at the trails' own fidelity they would cost ~25 %
+    /// more.
+    fn min_segment_px2_for(self, kind: crate::trails::WayKind) -> f32 {
+        let base = self.min_segment_px2();
+        if kind.is_offroad() || self == Self::Full {
+            base
+        } else {
+            base * 8.0
         }
     }
 }
@@ -126,6 +167,11 @@ pub struct TrackFinderApp {
     dem: DemStore,
     track: Track,
     walk: WalkSettings,
+    supply: SupplySettings,
+    /// One entry per waypoint: what is taken on there before setting off.
+    resupply: Vec<Resupply>,
+    /// Result of the food/water simulation over the current legs.
+    plan: Plan,
     /// The single ground layer. Always one of `BASE_MAPS`.
     base: RasterLayer,
     overlays: Vec<OverlaySetting>,
@@ -190,6 +236,9 @@ impl TrackFinderApp {
             dem: DemStore::new(source),
             track: Track::default(),
             walk: WalkSettings::default(),
+            supply: SupplySettings::default(),
+            resupply: Vec::new(),
+            plan: Plan::default(),
             base: RasterLayer::PlanIgn,
             overlays: vec![
                 OverlaySetting {
@@ -247,6 +296,12 @@ impl TrackFinderApp {
         self.update_graph(&ctx);
         self.resolve_pending_click(&ctx);
         self.update_bivouac(&ctx);
+        // Before the panel, so the figures it shows are this frame's and not the
+        // previous one's — the legs feed the supply plan, which feeds the load,
+        // which feeds every walking time on screen.
+        self.track
+            .refresh(&self.net, &mut self.dem, &self.walk, &ctx);
+        self.refresh_supply();
 
         egui::Panel::right("panel")
             .default_size(320.0)
@@ -326,8 +381,6 @@ impl TrackFinderApp {
             self.paint_trails(&painter, rect);
         }
         self.paint_isochrone(&painter, rect);
-        self.track
-            .refresh(&self.net, &mut self.dem, &self.walk, ctx);
         self.paint_track(&painter, rect);
         self.paint_bivouac(&painter, rect);
         self.paint_scale_bar(&painter, rect);
@@ -346,12 +399,12 @@ impl TrackFinderApp {
         let sw = self.view.screen_to_latlon(rect.left_bottom(), rect);
         let ne = self.view.screen_to_latlon(rect.right_top(), rect);
         let view = (sw.lat, sw.lon, ne.lat, ne.lon);
-        let min_px2 = self.detail.min_segment_px2();
         let mut pts: Vec<Pos2> = Vec::with_capacity(64);
         for way in self.net.ways() {
             if !way.intersects(view) || !self.detail.draws(way.kind) {
                 continue;
             }
+            let min_px2 = self.detail.min_segment_px2_for(way.kind);
             pts.clear();
             let last = way.points.len() - 1;
             for (i, ll) in way.points.iter().enumerate() {
@@ -367,9 +420,12 @@ impl TrackFinderApp {
                 }
             }
             if pts.len() >= 2 {
+                // Roads recede: present, so nothing looks missing, but never
+                // competing with the trails a route is actually built on.
+                let fade = if way.kind.is_offroad() { 0.75 } else { 0.4 };
                 painter.add(egui::Shape::line(
                     pts.clone(),
-                    Stroke::new(1.5, way.kind.color().gamma_multiply(0.75)),
+                    Stroke::new(1.5, way.kind.color().gamma_multiply(fade)),
                 ));
             }
         }
@@ -537,6 +593,20 @@ impl TrackFinderApp {
                     }
                 });
                 ui.weak(self.detail.hint());
+                if self.detail.hides_routable() {
+                    let hidden = self
+                        .net
+                        .ways()
+                        .iter()
+                        .filter(|w| !self.detail.draws(w.kind))
+                        .count();
+                    if hidden > 0 {
+                        ui.colored_label(
+                            Color32::from_rgb(200, 150, 60),
+                            format!("! {hidden} loaded ways not drawn — still routable"),
+                        );
+                    }
+                }
             }
             let (settled, loading, regions) = self.archive.stats();
             if regions == 0 {
@@ -657,49 +727,32 @@ impl TrackFinderApp {
 
             ui.separator();
             ui.strong("Walking");
-            let mut changed = false;
-            changed |= ui
-                .add(egui::Slider::new(&mut self.walk.flat_kmh, 2.0..=7.0).text("flat km/h"))
-                .changed();
-            changed |= ui
-                .add(
-                    egui::Slider::new(&mut self.walk.ascent_mh, 200.0..=1000.0)
-                        .text("ascent m/h"),
-                )
-                .changed();
-            changed |= ui
-                .add(
-                    egui::Slider::new(&mut self.walk.body_weight_kg, 40.0..=120.0)
-                        .text("body kg"),
-                )
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(&mut self.walk.pack_weight_kg, 0.0..=30.0).text("pack kg"))
-                .changed();
-            if changed {
-                self.track.recompute_time(&self.walk);
-                // Edge costs depend on the same settings as the time.
-                self.iso_dirty = true;
-            }
-            ui.label(format!(
-                "speed factor {:.2} · load limit {:.1} kg",
-                self.walk.speed_factor(),
-                self.walk.load_limit_kg()
-            ));
-            if self.walk.overloaded() {
-                ui.colored_label(
-                    Color32::from_rgb(200, 120, 0),
-                    "! pack over 20% of body weight",
-                );
-            }
+            self.walk_panel(ui);
 
             ui.separator();
-            ui.strong("Leg");
+            ui.strong("Profile");
+            self.profile_panel(ui);
+
+            ui.separator();
+            ui.strong("Supply");
+            self.supply_panel(ui);
+
+            ui.separator();
+            ui.strong("Track");
             let stats = *self.track.stats();
             ui.monospace(format!("distance  {:.2} km", stats.distance_m / 1000.0));
             ui.monospace(format!("ascent    {:.0} m", stats.ascent_m));
             ui.monospace(format!("descent   {:.0} m", stats.descent_m));
-            ui.monospace(format!("duration  {}", format_duration(stats.time_h)));
+            // The total comes from the simulation, not from the track stats: each
+            // leg is priced at the load carried that day.
+            ui.monospace(format!(
+                "duration  {}",
+                format_duration(if self.plan.legs.is_empty() {
+                    stats.time_h
+                } else {
+                    self.plan.total_time_h()
+                })
+            ));
             let legs = self.track.waypoints.len().saturating_sub(1);
             if legs > 0 {
                 let followed = self.track.followed_legs(&self.net);
@@ -711,6 +764,7 @@ impl TrackFinderApp {
             ui.horizontal(|ui| {
                 if ui.button("Clear track").clicked() {
                     self.track.clear();
+                    self.resupply.clear();
                     self.iso_dirty = true;
                 }
                 if ui.button("Recentre").clicked() {
@@ -754,6 +808,210 @@ impl TrackFinderApp {
                 ));
             }
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // Profile and autonomy (M4)
+    // -----------------------------------------------------------------------
+
+    /// Re-runs the food and water simulation and pushes the resulting load back
+    /// into the walking settings. Cheap — a handful of legs — so it runs every
+    /// frame rather than being invalidated by hand from six places.
+    fn refresh_supply(&mut self) {
+        let n = self.track.waypoints.len();
+        while self.resupply.len() < n {
+            // Day one starts with full bottles; a new bivouac assumes nothing.
+            self.resupply.push(if self.resupply.is_empty() {
+                Resupply::at_start()
+            } else {
+                Resupply::default()
+            });
+        }
+        self.resupply.truncate(n);
+
+        self.plan = supply::simulate(
+            self.track.legs(),
+            &self.resupply,
+            &self.walk,
+            &self.supply,
+        );
+
+        // The isochrone plans the *next* leg, so it must be priced with the pack
+        // as it will be at the last waypoint — resupply there included.
+        let load = self.plan.next_pack_kg;
+        if (load - self.walk.load_kg).abs() > 1e-6 {
+            self.walk.load_kg = load;
+            self.track.recompute_time(&self.walk);
+            self.iso_dirty = true;
+        }
+    }
+
+    /// Anything that changes a walking cost invalidates the isochrone too: the
+    /// edge weights and the leg times read the same settings.
+    fn walk_settings_changed(&mut self) {
+        self.track.recompute_time(&self.walk);
+        self.iso_dirty = true;
+    }
+
+    fn walk_panel(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            for model in SpeedModel::ALL {
+                changed |= ui
+                    .selectable_value(&mut self.walk.model, model, model.label())
+                    .changed();
+            }
+        });
+        match self.walk.model {
+            SpeedModel::Naismith => {
+                ui.weak("flat pace plus a climb rate; descent costs nothing")
+            }
+            SpeedModel::Tobler => ui.weak("speed from the local slope; descent counts"),
+        };
+
+        changed |= ui
+            .add(egui::Slider::new(&mut self.walk.flat_kmh, 2.0..=7.0).text("flat km/h"))
+            .changed();
+        ui.add_enabled_ui(self.walk.model == SpeedModel::Naismith, |ui| {
+            changed |= ui
+                .add(egui::Slider::new(&mut self.walk.ascent_mh, 200.0..=1000.0).text("ascent m/h"))
+                .changed();
+        });
+        changed |= ui
+            .add(egui::Slider::new(&mut self.walk.body_weight_kg, 40.0..=120.0).text("body kg"))
+            .changed();
+        if changed {
+            self.walk_settings_changed();
+        }
+        ui.label(format!(
+            "carrying {:.1} kg · factor {:.2} · limit {:.1} kg",
+            self.walk.load_kg,
+            self.walk.speed_factor(),
+            self.walk.load_limit_kg()
+        ));
+        if self.walk.overloaded() {
+            ui.colored_label(
+                Color32::from_rgb(200, 120, 0),
+                "! over the limit on the leg being planned",
+            );
+        }
+    }
+
+    fn profile_panel(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        changed |= ui
+            .add(egui::Slider::new(&mut self.supply.base_pack_kg, 0.0..=25.0).text("gear kg"))
+            .changed();
+        ui.weak("everything but food and water");
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut self.supply.ration_g_per_day, 300.0..=1500.0)
+                    .text("ration g/day"),
+            )
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut self.supply.food_start_kg, 0.0..=15.0).text("food kg"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut self.supply.water_capacity_l, 0.5..=6.0).text("water L"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut self.supply.water_rate_lph, 0.1..=1.5).text("drink L/h"))
+            .changed();
+        if changed {
+            // The plan is rebuilt next frame anyway; recompute now so the panel
+            // below this one is not a frame behind on a drag.
+            self.refresh_supply();
+        }
+        let days = if self.supply.ration_kg() > 0.0 {
+            self.supply.food_start_kg / self.supply.ration_kg()
+        } else {
+            0.0
+        };
+        ui.label(format!(
+            "{days:.1} days of food · {:.1} h of water",
+            if self.supply.water_rate_lph > 0.0 {
+                self.supply.water_capacity_l / self.supply.water_rate_lph
+            } else {
+                0.0
+            }
+        ));
+    }
+
+    fn supply_panel(&mut self, ui: &mut egui::Ui) {
+        if self.plan.legs.is_empty() {
+            ui.weak("place a second point to open a leg");
+            ui.label(format!("pack at the start  {:.1} kg", self.plan.next_pack_kg));
+            return;
+        }
+
+        let warn = Color32::from_rgb(200, 120, 0);
+        let bad = Color32::from_rgb(210, 70, 60);
+        let mut edited = false;
+
+        // The headline first: a trip that runs dry on day 6 should not need
+        // scrolling to day 6 to say so.
+        if self.plan.any_overloaded() {
+            ui.colored_label(warn, "! over the load limit on at least one leg");
+        }
+        if let Some(i) = self.plan.first_food_short() {
+            ui.colored_label(bad, format!("! out of food on day {}", i + 1));
+        }
+        if let Some(i) = self.plan.first_water_short() {
+            ui.colored_label(bad, format!("! water short on day {}", i + 1));
+        }
+
+        // Resupply is edited on the waypoint the leg leaves from, which is why
+        // the controls sit above the figures they change.
+        for (i, leg) in self.plan.legs.clone().iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.strong(format!("day {}", i + 1));
+                ui.monospace(format!(
+                    "{:.1} kg · {}",
+                    leg.pack_start_kg,
+                    format_duration(leg.time_h)
+                ));
+            });
+            if let Some(r) = self.resupply.get_mut(i) {
+                ui.horizontal(|ui| {
+                    edited |= ui
+                        .add(
+                            egui::DragValue::new(&mut r.food_kg)
+                                .speed(0.1)
+                                .range(0.0..=20.0)
+                                .prefix("+")
+                                .suffix(" kg food"),
+                        )
+                        .changed();
+                    edited |= ui.checkbox(&mut r.water_fill, "fill water").changed();
+                });
+            }
+            ui.monospace(format!(
+                "food {:.1} → {:.1} kg · water {:.1} → {:.1} L",
+                leg.food_start_kg, leg.food_end_kg, leg.water_start_l, leg.water_end_l
+            ));
+            if leg.overloaded {
+                ui.colored_label(warn, "! pack over 20% of body weight");
+            }
+            if leg.water_short {
+                ui.colored_label(
+                    bad,
+                    format!("! needs {:.1} L, carries {:.1} L", leg.water_need_l, leg.water_start_l),
+                );
+            }
+            if leg.food_short {
+                ui.colored_label(bad, "! out of food");
+            }
+            ui.separator();
+        }
+
+        if edited {
+            self.refresh_supply();
+        }
+        ui.monospace(format!(
+            "next leg starts at {:.1} kg",
+            self.plan.next_pack_kg
+        ));
     }
 
     fn paint_profile(&mut self, ui: &mut egui::Ui) {
@@ -1178,12 +1436,16 @@ mod tests {
                 );
                 crate::trails::Way {
                     id: i as i64,
-                    // A realistic mix: the detail control filters by class, and a
-                    // network of nothing but paths would hide that entirely.
-                    kind: match i % 3 {
-                        0 => crate::trails::WayKind::Path,
-                        1 => crate::trails::WayKind::Track,
-                        _ => crate::trails::WayKind::Road,
+                    // The mix measured on a real Chamonix tile: 23 % roads,
+                    // 16 % tracks, the rest hiking ways. A network of nothing
+                    // but paths would hide what the road decimation buys, and a
+                    // third of roads would overstate it.
+                    kind: match i % 100 {
+                        0..=22 => crate::trails::WayKind::Road,
+                        23..=38 => crate::trails::WayKind::Track,
+                        39..=67 => crate::trails::WayKind::Path,
+                        68..=95 => crate::trails::WayKind::Footway,
+                        _ => crate::trails::WayKind::Steps,
                     },
                     name: None,
                     nodes: Vec::new(),
@@ -1460,9 +1722,37 @@ mod tests {
                 assert!(full.draws(k), "{k:?} vanishes between normal and full");
             }
         }
-        assert!(full.draws(Road) && !normal.draws(Road), "roads separate the top two");
-        assert!(normal.draws(Track) && !sparse.draws(Track), "tracks separate the bottom two");
         assert!(sparse.draws(Path), "a hiking path is drawn at every level");
+        assert!(!sparse.draws(Road), "the escape hatch is the one that drops classes");
+    }
+
+    /// The rule the default has to keep: everything the graph can route on is on
+    /// the map. Only the level the user explicitly picks may hide a way, and it
+    /// has to admit it.
+    #[test]
+    fn only_the_escape_hatch_hides_a_routable_way() {
+        use crate::trails::WayKind::*;
+        for k in [Path, Track, Footway, Steps, Cycleway, Road] {
+            assert!(Detail::Normal.draws(k), "{k:?} missing from the default view");
+            assert!(Detail::Full.draws(k), "{k:?} missing at full detail");
+        }
+        assert!(Detail::Sparse.hides_routable());
+        assert!(!Detail::Normal.hides_routable());
+        assert!(!Detail::Full.hides_routable());
+    }
+
+    /// Roads are shown, but cheaply — that is what pays for showing them.
+    #[test]
+    fn roads_are_decimated_harder_than_trails() {
+        use crate::trails::WayKind::*;
+        let d = Detail::Normal;
+        assert!(d.min_segment_px2_for(Road) > d.min_segment_px2_for(Path));
+        assert_eq!(d.min_segment_px2_for(Path), d.min_segment_px2_for(Track));
+        // At full detail the user asked for sharpness everywhere.
+        assert_eq!(
+            Detail::Full.min_segment_px2_for(Road),
+            Detail::Full.min_segment_px2_for(Path)
+        );
     }
 
     /// More detail means a finer decimation threshold, never a coarser one.
@@ -1496,6 +1786,53 @@ mod tests {
     }
 
     /// The base map is a single choice, and an overlay is never a ground layer.
+    /// M4 end to end: the supply plan must actually reach the walking settings,
+    /// not just sit in a panel. A resupply at the last bivouac makes the pack
+    /// heavier, and the leg the isochrone is about to plan must get slower.
+    #[test]
+    fn a_resupply_slows_the_leg_being_planned() {
+        let mut app = offline_app();
+        let ctx = egui::Context::default();
+        for lat in [45.0, 45.02, 45.04] {
+            app.track.push(Waypoint::free(LatLon::new(lat, 6.0)));
+        }
+        app.track
+            .refresh(&app.net, &mut app.dem, &app.walk, &ctx);
+        app.refresh_supply();
+
+        assert_eq!(app.track.legs().len(), 2);
+        assert_eq!(app.resupply.len(), 3);
+        let before = app.walk.speed_factor();
+        assert!((app.walk.load_kg - app.plan.next_pack_kg).abs() < 1e-9);
+
+        // Ten kilos taken on at the last waypoint — the start of the next leg.
+        app.resupply[2].food_kg = 10.0;
+        app.refresh_supply();
+        assert!(app.walk.load_kg > app.plan.legs[0].pack_start_kg);
+        assert!(app.walk.speed_factor() < before);
+        assert!(app.iso_dirty, "the isochrone must be re-priced");
+    }
+
+    /// The load carried is a per-leg figure, and the total time is the sum of
+    /// legs priced at their own load — not one time computed at one weight.
+    #[test]
+    fn the_pack_lightens_from_one_day_to_the_next() {
+        let mut app = offline_app();
+        let ctx = egui::Context::default();
+        for lat in [45.0, 45.02, 45.04] {
+            app.track.push(Waypoint::free(LatLon::new(lat, 6.0)));
+        }
+        app.track
+            .refresh(&app.net, &mut app.dem, &app.walk, &ctx);
+        app.refresh_supply();
+
+        let legs = &app.plan.legs;
+        assert!(legs[1].pack_start_kg < legs[0].pack_start_kg);
+        // Same ground, lighter pack: the second day is quicker.
+        assert!((app.track.legs()[0].base_time_h - app.track.legs()[1].base_time_h).abs() < 1e-6);
+        assert!(legs[1].time_h < legs[0].time_h);
+    }
+
     #[test]
     fn the_base_map_is_exclusive() {
         let mut app = TrackFinderApp::new();

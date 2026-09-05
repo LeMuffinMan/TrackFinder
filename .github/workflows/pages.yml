@@ -22,8 +22,18 @@ env:
   # rebuilding them takes several minutes: without this key they would be
   # regenerated on every push for data that has not meaningfully changed.
   DATA_EPOCH: "2026-09"
-  # The French Alps, matching the application's opening view.
+  # The western Alps, matching the application's opening view.
   ALPS_BBOX: "43.95,5.35,46.45,7.75"
+  # ⚠️ The box straddles two borders. Feeding it French extracts only left a
+  # clean diagonal hole along the frontier — the Vallée Étroite south-east of
+  # Mont Thabor, the Swiss stage of the Tour du Mont-Blanc, the Italian side of
+  # the Queyras. OSM data has no notion of a national boundary; Geofabrik's
+  # regions do. Whatever the box claims, the extracts must cover.
+  EXTRACTS: >-
+    europe/france/rhone-alpes
+    europe/france/provence-alpes-cote-d-azur
+    europe/italy/nord-ovest
+    europe/switzerland
 
 jobs:
   build:
@@ -68,8 +78,13 @@ jobs:
       # A cache key may not contain commas, and the bounding box is full of them.
       # Derived here rather than kept as a second, dash-separated copy of the
       # box: two hand-maintained forms of the same value drift.
+      # The extract list belongs in the key too: adding a region changes the
+      # data without touching the box, and a stale hit would serve the very hole
+      # the new region was added to fill.
       - name: Derive the data cache key
-        run: echo "DATA_KEY=${DATA_EPOCH}-${ALPS_BBOX//,/_}" >> "$GITHUB_ENV"
+        run: |
+          extracts_hash=$(printf '%s' "$EXTRACTS" | sha256sum | cut -c1-12)
+          echo "DATA_KEY=${DATA_EPOCH}-${ALPS_BBOX//,/_}-${extracts_hash}" >> "$GITHUB_ENV"
 
       # The archives are generated, never committed: a regenerated 30 MB blob in
       # git history would be there for good. The key covers the preprocessor's
@@ -83,24 +98,28 @@ jobs:
           path: data/trails
           key: trails-${{ env.DATA_KEY }}-${{ hashFiles('trailprep/src/**', 'trailfmt/src/**') }}
 
-      # ~850 MB of extracts in, ~2 GB of RAM, a few minutes of CPU. Measured on
-      # 2026-09-04: Rhône-Alpes alone peaked at 1.08 GB and took 219 s.
+      # ~2 GB of extracts in, a few minutes of CPU. Peak memory scales with the
+      # walkable ways of *every* extract, not with the box: measured on
+      # 2026-09-04, Rhône-Alpes alone peaked at 1.08 GB in 219 s, so four
+      # regions is the scale to watch. `/usr/bin/time -v` below reports it — if
+      # it ever approaches the runner's ceiling, the answer is to clip the
+      # extracts before trailprep, not to drop a region and reopen the hole.
       - name: Build trail archives
         if: steps.trails-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           mkdir -p data/extracts data/trails
-          for region in rhone-alpes provence-alpes-cote-d-azur; do
+          for region in $EXTRACTS; do
             echo "downloading $region"
             curl -sSL --retry 3 --retry-delay 5 \
-              -o "data/extracts/$region.osm.pbf" \
-              "https://download.geofabrik.de/europe/france/$region-latest.osm.pbf"
+              -o "data/extracts/${region//\//-}.osm.pbf" \
+              "https://download.geofabrik.de/$region-latest.osm.pbf"
           done
-          # Both extracts in one run, deliberately: a node shared by two ways on
-          # either side of the regional boundary is only seen as a junction if
-          # both files are counted together.
-          cargo run --release --locked -p trailprep -- \
-            --name "Alpes françaises" \
+          # All extracts in one run, deliberately: a node shared by two ways on
+          # either side of a regional or national boundary is only seen as a
+          # junction if every file is counted together.
+          /usr/bin/time -v cargo run --release --locked -p trailprep -- \
+            --name "Alpes occidentales" \
             --out data/trails/alps \
             --bbox "$ALPS_BBOX" \
             data/extracts/*.osm.pbf

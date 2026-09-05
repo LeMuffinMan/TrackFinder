@@ -718,3 +718,78 @@ mod tests {
         );
     }
 }
+
+/// Coverage checks against the tiles actually deployed.
+/// `cargo test --release -- --ignored`
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod coverage {
+    use crate::geo::{haversine_m, LatLon};
+
+    const BASE: &str = "https://lemuffinman.github.io/TrackFinder/trails/alps/";
+
+    fn ways_at(pos: LatLon) -> Vec<trailfmt::ArchiveWay> {
+        let z = trailfmt::TILE_ZOOM;
+        let url = format!("{BASE}{}", trailfmt::tile_path(z, trailfmt::tile_of(pos.lat, pos.lon, z)));
+        let resp = ehttp::fetch_blocking(&ehttp::Request::get(&url)).expect("fetch");
+        if !resp.ok {
+            return Vec::new();
+        }
+        trailfmt::decode_tile(&resp.bytes).expect("tile")
+    }
+
+    /// The bounding box crosses into Italy and Switzerland, so the archive has
+    /// to as well.
+    ///
+    /// ⚠️ This is a regression test for a real, silent hole: fed French
+    /// extracts only, the archive stopped dead on the frontier — a clean
+    /// diagonal cut south-east of Mont Thabor, right through the Vallée
+    /// Étroite. Nothing errored; the trails simply were not there, and an
+    /// isochrone reads a missing network as "not reachable".
+    #[test]
+    #[ignore = "network"]
+    fn the_far_side_of_the_border_is_covered() {
+        // Deep inside foreign ground, not a couple of kilometres from the
+        // frontier: near the line, French ways alone would pass the test.
+        for (name, pos) in [
+            ("Bardonecchia (IT)", LatLon::new(45.077, 6.700)),
+            ("Champex-Lac, TMB (CH)", LatLon::new(46.028, 7.112)),
+        ] {
+            let ways = ways_at(pos);
+            let near = ways
+                .iter()
+                .filter(|w| {
+                    w.points
+                        .iter()
+                        .any(|(lat, lon)| haversine_m(pos, LatLon::new(*lat, *lon)) < 1_500.0)
+                })
+                .count();
+            println!("{name}: {near} ways within 1.5 km");
+            assert!(near >= 5, "{name}: {near} ways within 1.5 km");
+        }
+    }
+
+    /// `trailprep` files a way by its **first node**, so a way lives whole in
+    /// one tile and sticks out of it. The reader's loading radius has to be
+    /// wider than that overhang, or a way reaching into the view from an
+    /// unloaded tile is invisible.
+    #[test]
+    #[ignore = "network"]
+    fn ways_do_not_reach_further_than_the_loading_radius() {
+        let ways = ways_at(LatLon::new(45.92, 6.87));
+        assert!(!ways.is_empty(), "no tile over Chamonix");
+        let worst = ways
+            .iter()
+            .map(|w| {
+                let first = LatLon::new(w.points[0].0, w.points[0].1);
+                w.points
+                    .iter()
+                    .map(|(lat, lon)| haversine_m(first, LatLon::new(*lat, *lon)))
+                    .fold(0.0f64, f64::max)
+            })
+            .fold(0.0f64, f64::max);
+        println!("{} ways · worst reach {worst:.0} m", ways.len());
+        assert!(worst < crate::app::VIEW_RADIUS_M, "worst reach {worst:.0} m");
+    }
+}
+
