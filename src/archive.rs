@@ -18,12 +18,37 @@ use crate::geo::LatLon;
 /// Where the data lives, relative to the page under WASM.
 ///
 /// Natively there is no page to be relative to, so development expects
-/// `trunk serve` on its default port. The tiles are never committed: CI
-/// generates them.
+/// `trunk serve` on its default port.
 #[cfg(target_arch = "wasm32")]
-pub const DATA_BASE: &str = "trails/";
+const DEFAULT_DATA_BASE: &str = "trails/";
 #[cfg(not(target_arch = "wasm32"))]
-pub const DATA_BASE: &str = "http://localhost:8080/trails/";
+const DEFAULT_DATA_BASE: &str = "http://localhost:8080/trails/";
+
+/// Data root, overridable at **build** time:
+///
+/// ```text
+/// TRACKFINDER_DATA_BASE=https://<user>.github.io/TrackFinder/trails/ trunk serve --release
+/// ```
+///
+/// ⚠️ Why this exists rather than a line one edits by hand. The tiles are
+/// generated and never committed, so a working copy carries whatever
+/// `trailprep` last produced — possibly a smaller box, possibly stale, and
+/// **nothing on screen says so**: a missing region looks exactly like ground
+/// with no trails on it. Pointing a local build at the deployed archive is the
+/// quickest way to tell the two apart, and it must not require editing a
+/// constant that would then travel in a commit.
+///
+/// GitHub Pages answers `access-control-allow-origin: *`, so the cross-origin
+/// fetch from `localhost` goes through.
+///
+/// Read by `option_env!`, so it is baked in at compile time and costs nothing at
+/// runtime. Cargo tracks the variable and rebuilds when it changes; it does not
+/// notice a change made *between* a build and a `trunk serve` that reuses that
+/// build, so pass it on the command line that builds.
+pub const DATA_BASE: &str = match option_env!("TRACKFINDER_DATA_BASE") {
+    Some(base) => base,
+    None => DEFAULT_DATA_BASE,
+};
 
 pub const MANIFEST_FILE: &str = "regions.json";
 
@@ -461,6 +486,17 @@ mod tests {
     /// A dev server hands back `index.html` for anything it does not have, so a
     /// missing manifest arrives as a 200 full of HTML. The message must say what
     /// is actually wrong and where, not "expected value at line 1 column 1".
+    /// Every URL is built by concatenation, so a base without its trailing
+    /// slash silently produces `…trailsregions.json`. Easy to get wrong now
+    /// that the value can come from the environment.
+    #[test]
+    fn the_data_base_ends_with_a_slash() {
+        assert!(
+            DATA_BASE.ends_with('/'),
+            "TRACKFINDER_DATA_BASE must end with a slash: {DATA_BASE}"
+        );
+    }
+
     #[test]
     fn a_missing_manifest_says_so_in_words() {
         let mut store = TrailArchive::new("http://localhost:8080/trails/");
